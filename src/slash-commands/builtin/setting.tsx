@@ -2,11 +2,12 @@ import { Box, Text, useInput } from 'ink';
 import pc from 'picocolors';
 import type React from 'react';
 import { useEffect, useState } from 'react';
-import { ModelSelect } from './model';
-import PaginatedSelectInput from '../../ui/PaginatedSelectInput';
+import type { Config } from '../../config';
 import PaginatedGroupSelectInput from '../../ui/PaginatedGroupSelectInput';
+import PaginatedSelectInput from '../../ui/PaginatedSelectInput';
 import { useAppStore } from '../../ui/store';
 import type { LocalJSXCommand } from '../types';
+import { ModelSelect } from './model';
 
 type SettingCategory =
   | 'main'
@@ -30,7 +31,7 @@ const SettingManagerComponent: React.FC<SettingManagerProps> = ({ onExit }) => {
   const { bridge, cwd } = useAppStore();
   const [category, setCategory] = useState<SettingCategory>('main');
   const [lastCategory, setLastCategory] = useState<SettingCategory>('model');
-  const [currentConfig, setCurrentConfig] = useState<any>({});
+  const [currentConfig, setCurrentConfig] = useState<Partial<Config>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [extensionInfo, setExtensionInfo] = useState<{
@@ -64,7 +65,7 @@ const SettingManagerComponent: React.FC<SettingManagerProps> = ({ onExit }) => {
   }, [cwd, bridge]);
 
   // Handle ESC key to go back
-  useInput((input, key) => {
+  useInput((_input, key) => {
     if (key.escape) {
       if (category === 'main') {
         onExit('Settings closed');
@@ -75,7 +76,11 @@ const SettingManagerComponent: React.FC<SettingManagerProps> = ({ onExit }) => {
     }
   });
 
-  const saveConfig = async (key: string, value: any, isGlobal = true) => {
+  const saveConfig = async (
+    key: string,
+    value: string | boolean,
+    isGlobal = true,
+  ) => {
     setSaving(true);
     try {
       await bridge.request('config.set', {
@@ -96,8 +101,8 @@ const SettingManagerComponent: React.FC<SettingManagerProps> = ({ onExit }) => {
   };
 
   const renderMainMenu = () => {
-    const getDisplayValue = (key: string) => {
-      const value = currentConfig[key as keyof typeof currentConfig];
+    const getDisplayValue = (key: keyof Config) => {
+      const value = currentConfig[key];
       if (value === undefined || value === null) return '';
       if (typeof value === 'boolean') return value ? 'On' : 'Off';
       return String(value);
