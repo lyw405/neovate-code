@@ -261,7 +261,7 @@ export function ChatInput() {
               return (
                 <SuggestionItem
                   name={suggestion}
-                  description={'history'}
+                  description={''}
                   isSelected={isSelected}
                   firstColumnWidth={maxNameLength + 4}
                 />
