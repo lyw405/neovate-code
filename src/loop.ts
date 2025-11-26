@@ -20,18 +20,95 @@ import type { ToolResult, Tools, ToolUse } from './tool';
 import { Usage } from './usage';
 import { randomUUID } from './utils/randomUUID';
 import { safeParseJson } from './utils/safeParseJson';
+import type { TurnSnapshotCollector } from './utils/snapshot';
 
 const DEFAULT_MAX_TURNS = 50;
 const DEFAULT_ERROR_RETRY_TURNS = 10;
 
 const debug = createDebug('neovate:loop');
 
+/**
+ * Collect file snapshot for tool operations
+ */
+async function collectFileSnapshot(
+  snapshotCollector: TurnSnapshotCollector,
+  toolUse: ToolUse,
+  toolResult: ToolResult,
+  cwd: string,
+): Promise<void> {
+  try {
+    if (toolUse.name === 'write' || toolUse.name === 'edit') {
+      const filePath = toolUse.params.file_path;
+      if (filePath && typeof filePath === 'string') {
+        const fs = await import('fs');
+        const path = await import('pathe');
+        const absolutePath = path.isAbsolute(filePath)
+          ? filePath
+          : path.resolve(cwd, filePath);
+
+        // Get beforeContent from toolResult._rawParams (set by tool.invoke)
+        const beforeContent = toolResult._rawParams?._beforeContent as
+          | string
+          | undefined;
+        const beforeExists = beforeContent !== undefined;
+
+        const fileExists = fs.existsSync(absolutePath);
+        const content = fileExists
+          ? fs.readFileSync(absolutePath, 'utf-8')
+          : undefined;
+
+        if (beforeExists && !fileExists) {
+          snapshotCollector.addOperation({
+            type: 'delete',
+            path: filePath,
+            source: toolUse.name as 'write' | 'edit',
+            content: beforeContent,
+          });
+        } else {
+          snapshotCollector.addOperation({
+            type: beforeExists ? 'modify' : 'create',
+            path: filePath,
+            source: toolUse.name as 'write' | 'edit',
+            // For modify: store BEFORE content in 'content' and AFTER content in 'afterContent'
+            // For create: store AFTER content in 'content'
+            content: beforeExists ? beforeContent : content,
+            afterContent: beforeExists ? content : undefined,
+          });
+        }
+      }
+    } else if (toolUse.name === 'bash') {
+      const bashFiles = toolResult._affectedFiles as string[] | undefined;
+      if (bashFiles && Array.isArray(bashFiles)) {
+        const fs = await import('fs');
+        const path = await import('pathe');
+        for (const filePath of bashFiles) {
+          const absolutePath = path.isAbsolute(filePath)
+            ? filePath
+            : path.resolve(cwd, filePath);
+
+          if (fs.existsSync(absolutePath)) {
+            const content = fs.readFileSync(absolutePath, 'utf-8');
+            snapshotCollector.addOperation({
+              type: 'create',
+              path: filePath,
+              source: 'bash',
+              content,
+            });
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Failed to collect snapshot:', error);
+  }
+}
+
 async function exponentialBackoffWithCancellation(
   attempt: number,
   signal?: AbortSignal,
 ): Promise<void> {
   const baseDelay = 1000;
-  const delay = baseDelay * Math.pow(2, attempt - 1);
+  const delay = baseDelay * 2 ** (attempt - 1);
   const checkInterval = 100;
 
   const startTime = Date.now();
@@ -118,6 +195,7 @@ type RunLoopOpts = {
   }) => Promise<void>;
   onToolApprove?: (toolUse: ToolUse) => Promise<boolean>;
   onMessage?: OnMessage;
+  snapshotCollector?: TurnSnapshotCollector;
 };
 
 export async function runLoop(opts: RunLoopOpts): Promise<LoopResult> {
@@ -230,7 +308,7 @@ export async function runLoop(opts: RunLoopOpts): Promise<LoopResult> {
     const tools = opts.tools.toLanguageV2Tools();
 
     // Get thinking config based on model's reasoning capability
-    let thinkingConfig: Record<string, any> | undefined = undefined;
+    let thinkingConfig: Record<string, any> | undefined;
     if (shouldThinking && opts.thinking) {
       thinkingConfig = getThinkingConfig(opts.model, opts.thinking.effort);
       shouldThinking = false;
@@ -468,6 +546,16 @@ export async function runLoop(opts: RunLoopOpts): Promise<LoopResult> {
         );
         if (opts.onToolResult) {
           toolResult = await opts.onToolResult(toolUse, toolResult, approved);
+        }
+
+        // Collect file snapshot for write/edit/bash tools
+        if (opts.snapshotCollector && !toolResult.isError) {
+          await collectFileSnapshot(
+            opts.snapshotCollector,
+            toolUse,
+            toolResult,
+            opts.cwd,
+          );
         }
         toolResults.push({
           toolCallId: toolUse.callId,

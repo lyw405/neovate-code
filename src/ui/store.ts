@@ -130,14 +130,12 @@ interface AppState {
     resolve: (result: 'project' | 'global' | null) => void;
   } | null;
 
-  upgrade: {
-    text: string;
-    type?: 'success' | 'error';
-  } | null;
+  upgrade: { text: string; type?: 'success' | 'error' } | null;
 
-  forkModalVisible: boolean;
   forkParentUuid: string | null;
-  forkCounter: number;
+  restoreCounter: number;
+
+  snapshotModalVisible: boolean;
 
   bashBackgroundPrompt: BashPromptBackgroundEvent | null;
   thinking: { effort: 'low' | 'medium' | 'high' } | undefined;
@@ -206,10 +204,10 @@ interface AppActions {
   resetInput: () => void;
   setPastedTextMap: (map: Record<string, string>) => Promise<void>;
   setPastedImageMap: (map: Record<string, string>) => Promise<void>;
-  showForkModal: () => void;
-  hideForkModal: () => void;
-  fork: (targetMessageUuid: string) => Promise<void>;
-  incrementForkCounter: () => void;
+  restoreSnapshot: (targetMessageUuid: string) => Promise<void>;
+  incrementRestoreCounter: () => void;
+  showSnapshotModal: () => void;
+  hideSnapshotModal: () => void;
   setBashBackgroundPrompt: (prompt: BashPromptBackgroundEvent) => void;
   clearBashBackgroundPrompt: () => void;
   toggleThinking: () => void;
@@ -264,10 +262,11 @@ export const useAppStore = create<AppStore>()(
       inputError: null,
       pastedTextMap: {},
       pastedImageMap: {},
-      forkModalVisible: false,
       forkParentUuid: null,
-      forkCounter: 0,
+      restoreCounter: 0,
       thinking: undefined,
+
+      snapshotModalVisible: false,
 
       bashBackgroundPrompt: null,
 
@@ -795,7 +794,6 @@ export const useAppStore = create<AppStore>()(
           processingTokens: 0,
           retryInfo: null,
           forkParentUuid: null,
-          forkModalVisible: false,
         });
         return {
           sessionId,
@@ -895,7 +893,6 @@ export const useAppStore = create<AppStore>()(
           pastedTextMap,
           pastedImageMap,
           forkParentUuid: null,
-          forkModalVisible: false,
         });
       },
 
@@ -998,56 +995,73 @@ export const useAppStore = create<AppStore>()(
         }
       },
 
-      showForkModal: () => {
-        set({ forkModalVisible: true });
+      showSnapshotModal: () => {
+        set({ snapshotModalVisible: true });
       },
 
-      hideForkModal: () => {
-        set({ forkModalVisible: false });
+      hideSnapshotModal: () => {
+        set({ snapshotModalVisible: false });
       },
 
-      fork: async (targetMessageUuid: string) => {
-        const { bridge, cwd, sessionId, messages } = get();
+      restoreSnapshot: async (targetMessageUuid: string) => {
+        const { bridge, cwd, sessionId } = get();
 
-        // Find the target message
-        const targetMessage = messages.find(
-          (m) => (m as NormalizedMessage).uuid === targetMessageUuid,
-        );
-        if (!targetMessage) {
-          get().log(`Fork error: Message ${targetMessageUuid} not found`);
+        try {
+          const restoreResponse = await bridge.request('session.restoreCode', {
+            cwd,
+            sessionId,
+            targetMessageUuid,
+          });
+
+          if (restoreResponse.success) {
+            const { restoredFiles, skippedBashFiles, userPromptToFill } =
+              restoreResponse.data;
+
+            // Fill the user prompt from snapshot if available
+            if (userPromptToFill) {
+              set({
+                inputValue: userPromptToFill,
+                inputCursorPosition: userPromptToFill.length,
+              });
+            } else {
+              // Clear input if no prompt to fill
+              set({ inputValue: '' });
+            }
+
+            // Reload messages to show the restore hint message
+            const messagesResponse = await bridge.request(
+              'session.messages.list',
+              { cwd, sessionId },
+            );
+            if (messagesResponse.success) {
+              set({ messages: messagesResponse.data.messages });
+            }
+
+            // Log restore summary
+            if (restoredFiles.length > 0) {
+              get().log(`Restored ${restoredFiles.length} file(s)`);
+            }
+            if (skippedBashFiles.length > 0) {
+              get().log(
+                `Skipped ${skippedBashFiles.length} file(s) modified by bash tool`,
+              );
+            }
+          } else {
+            get().log(
+              `Failed to restore: ${restoreResponse.error?.message || 'Unknown error'}`,
+            );
+            return;
+          }
+        } catch (error: any) {
+          get().log(`Error during restore: ${error.message}`);
           return;
         }
 
-        // Filter messages up to and including the target
-        const messageIndex = messages.findIndex(
-          (m) => (m as NormalizedMessage).uuid === targetMessageUuid,
-        );
-        const filteredMessages = messages.slice(0, messageIndex);
-
-        // Extract content from target message
-        let contentText = '';
-        if (typeof targetMessage.content === 'string') {
-          contentText = targetMessage.content;
-        } else if (Array.isArray(targetMessage.content)) {
-          const textParts = targetMessage.content
-            .filter((part) => part.type === 'text')
-            .map((part) => part.text);
-          contentText = textParts.join('');
-        }
-
-        // Update store state
-        set({
-          messages: filteredMessages,
-          forkParentUuid: (targetMessage as NormalizedMessage).parentUuid,
-          inputValue: contentText,
-          inputCursorPosition: contentText.length,
-          forkModalVisible: false,
-        });
-        get().incrementForkCounter();
+        get().incrementRestoreCounter();
       },
 
-      incrementForkCounter: () => {
-        set({ forkCounter: get().forkCounter + 1 });
+      incrementRestoreCounter: () => {
+        set({ restoreCounter: get().restoreCounter + 1 });
       },
 
       setStatus: (status: AppStatus) => {

@@ -1639,6 +1639,298 @@ class NodeHandlerRegistry {
       },
     );
 
+    this.messageBus.registerHandler(
+      'session.restoreCode',
+      async (data: {
+        cwd: string;
+        sessionId: string;
+        targetMessageUuid: string;
+      }) => {
+        const { cwd, sessionId, targetMessageUuid } = data;
+        const context = await this.getContext(cwd);
+        const sessionConfigManager = new SessionConfigManager({
+          logPath: context.paths.getSessionLogPath(sessionId),
+        });
+
+        const { buildRestoreOperations, restoreFilesFromOperations } =
+          await import('./utils/snapshot');
+        const { loadSessionMessages } = await import('./session');
+
+        // Get all file snapshots
+        const fileSnapshots = sessionConfigManager.config.fileSnapshots || [];
+
+        // Load messages to resolve parent relationships
+        const messages = loadSessionMessages({
+          logPath: context.paths.getSessionLogPath(sessionId),
+        });
+
+        // Get target snapshot to extract user prompt
+        const targetSnapshot = fileSnapshots.find(
+          (s) => s.messageUuid === targetMessageUuid,
+        );
+
+        if (!targetSnapshot) {
+          return {
+            success: false,
+            data: {
+              restoredFiles: [],
+              skippedBashFiles: [],
+              skippedLargeFiles: [],
+              errors: [{ file: '', error: 'Target snapshot not found' }],
+              userPromptToFill: undefined,
+            },
+            error: { message: 'Target snapshot not found' },
+          };
+        }
+
+        const userPromptToFill = targetSnapshot.userPrompt;
+
+        // Build restore operations (parent state + cleanup files created after)
+        // Pass messages to buildRestoreOperations so it can resolve parent snapshots correctly
+        const operations = buildRestoreOperations(
+          fileSnapshots,
+          targetMessageUuid,
+          messages,
+        );
+
+        // Get maxFileSize before using it
+        const maxFileSize = context.config.snapshot?.maxFileSize;
+
+        const fs = await import('fs');
+        const path = await import('pathe');
+
+        // Restore to target's parent state
+        const result = restoreFilesFromOperations(operations, cwd, maxFileSize);
+
+        // Clear conversation history and snapshots
+        try {
+          const messages = loadSessionMessages({
+            logPath: context.paths.getSessionLogPath(sessionId),
+          });
+
+          // Find the target message to get timestamp and parent
+          const targetMessage = messages.find(
+            (m) => m.uuid === targetMessageUuid,
+          );
+          const timestamp = targetMessage?.timestamp
+            ? new Date(targetMessage.timestamp).toLocaleString()
+            : 'previous state';
+
+          // Find the target message index (will be reused later for filtering)
+          const targetMsgIndex = messages.findIndex(
+            (m) => m.uuid === targetMessageUuid,
+          );
+
+          // Find the correct parent for hint message
+          // It should be the last message BEFORE the target (target's parent or earlier)
+          const lastMessageBeforeTarget =
+            targetMsgIndex > 0 ? messages[targetMsgIndex - 1] : null;
+
+          // Create a hint message
+          const { randomUUID } = await import('./utils/randomUUID');
+          const hintMessage: NormalizedMessage = {
+            parentUuid: lastMessageBeforeTarget?.uuid || null,
+            uuid: randomUUID(),
+            role: 'assistant',
+            content: userPromptToFill
+              ? `Code restored to before: ${userPromptToFill}`
+              : `Code restored to: ${timestamp}`,
+            text: userPromptToFill
+              ? `Code restored to before: ${userPromptToFill}`
+              : `Code restored to: ${timestamp}`,
+            model: 'system',
+            usage: { input_tokens: 0, output_tokens: 0 },
+            uiContent: [
+              '✨ Code and conversation restored successfully',
+              '',
+              `📁 Restored ${result.restoredFiles.length} file(s)`,
+              result.skippedBashFiles.length > 0
+                ? `⏭️  Skipped ${result.skippedBashFiles.length} bash-generated file(s)`
+                : null,
+              result.skippedLargeFiles.length > 0
+                ? `⚠️  Skipped ${result.skippedLargeFiles.length} large file(s)`
+                : null,
+              '',
+              userPromptToFill
+                ? `🕒 Restored to BEFORE: "${userPromptToFill}"`
+                : `🕒 Restored to: ${timestamp}`,
+              '',
+              userPromptToFill
+                ? '💡 The prompt has been filled in the input box.'
+                : '',
+              userPromptToFill
+                ? '   You can edit and run again, or clear it to continue.'
+                : 'You can continue your work from this point.',
+            ]
+              .filter(Boolean)
+              .join('\n'),
+            type: 'message',
+            timestamp: new Date().toISOString(),
+          };
+
+          // Clean snapshots: keep only those created BEFORE target time
+          // IMPORTANT: We keep snapshots BEFORE target (not including target)
+          // because we want to restore to the state BEFORE the target operation
+          if (targetSnapshot) {
+            const targetTime = new Date(targetSnapshot.timestamp).getTime();
+
+            // Keep all snapshots created BEFORE the target time (excluding target)
+            const cleanedSnapshots = fileSnapshots.filter((snapshot) => {
+              const snapshotTime = new Date(snapshot.timestamp).getTime();
+              return snapshotTime < targetTime;
+            });
+
+            // Update session config with cleaned snapshots
+            sessionConfigManager.config.fileSnapshots = cleanedSnapshots;
+          }
+
+          // Filter messages: keep only those up to (and including) target message's parent
+          // This preserves the conversation history up to the restore point
+          const targetMessageIndex = messages.findIndex(
+            (m) => m.uuid === targetMessageUuid,
+          );
+
+          let filteredMessages: any[];
+          if (targetMessageIndex >= 0) {
+            // Keep all messages BEFORE the target message
+            filteredMessages = messages.slice(0, targetMessageIndex);
+          } else {
+            filteredMessages = messages;
+          }
+
+          // Add hint message
+          filteredMessages.push(hintMessage);
+
+          // Write filtered messages back to log file
+          const fs = await import('fs');
+          // Preserve config line with cleaned snapshots
+          const configLine = JSON.stringify({
+            type: 'config',
+            config: sessionConfigManager.config,
+          });
+
+          const messageLines = filteredMessages.map((m) => JSON.stringify(m));
+          const newContent = [configLine, ...messageLines].join('\n') + '\n';
+
+          fs.writeFileSync(
+            context.paths.getSessionLogPath(sessionId),
+            newContent,
+            'utf-8',
+          );
+        } catch (error) {
+          // If clearing history fails, just log the error but still return success
+          console.error(
+            'Failed to clear conversation history after restore:',
+            error,
+          );
+        }
+
+        return {
+          success: result.success,
+          data: {
+            restoredFiles: result.restoredFiles,
+            skippedBashFiles: result.skippedBashFiles,
+            skippedLargeFiles: result.skippedLargeFiles,
+            errors: result.errors,
+            userPromptToFill,
+          },
+          error:
+            result.errors.length > 0
+              ? {
+                  message: result.errors.map((e) => e.error).join('; '),
+                }
+              : undefined,
+        };
+      },
+    );
+
+    this.messageBus.registerHandler(
+      'session.listSnapshots',
+      async (data: { cwd: string; sessionId: string }) => {
+        const { cwd, sessionId } = data;
+        const context = await this.getContext(cwd);
+        const sessionConfigManager = new SessionConfigManager({
+          logPath: context.paths.getSessionLogPath(sessionId),
+        });
+        const { loadSessionMessages } = await import('./session');
+        const { relative } = await import('pathe');
+
+        const fileSnapshots = sessionConfigManager.config.fileSnapshots || [];
+        const messages = loadSessionMessages({
+          logPath: context.paths.getSessionLogPath(sessionId),
+        });
+
+        // Build message map for quick lookup
+        const messageMap = new Map(messages.map((m) => [m.uuid, m]));
+
+        // Helper to extract user prompt from parent message
+        const getUserPrompt = (messageUuid: string): string | undefined => {
+          let currentMsg: any = messageMap.get(messageUuid);
+          if (!currentMsg) return undefined;
+
+          // Walk backward to find the nearest user message
+          const visited = new Set<string>();
+          while (currentMsg && !visited.has(currentMsg.uuid)) {
+            visited.add(currentMsg.uuid);
+
+            if (currentMsg.role === 'user') {
+              // Found user message, extract content
+              const content = currentMsg.content;
+              if (typeof content === 'string') {
+                return content;
+              }
+              if (Array.isArray(content)) {
+                const textParts = content
+                  .filter((part: any) => part.type === 'text')
+                  .map((part: any) => part.text);
+                return textParts.join(' ');
+              }
+              return undefined;
+            }
+
+            // Move to parent
+            const parentUuid =
+              currentMsg.parentUuid || currentMsg.parentMessageUuid;
+            if (!parentUuid) return undefined;
+            currentMsg = messageMap.get(parentUuid);
+          }
+
+          return undefined;
+        };
+
+        // Enrich snapshots with message info
+        const enrichedSnapshots = fileSnapshots.map((snapshot) => {
+          const message = messageMap.get(snapshot.messageUuid);
+          // Prefer userPrompt from snapshot, fallback to getUserPrompt for old snapshots
+          const userPrompt =
+            snapshot.userPrompt || getUserPrompt(snapshot.messageUuid);
+
+          return {
+            messageUuid: snapshot.messageUuid,
+            parentMessageUuid: snapshot.parentMessageUuid,
+            timestamp: snapshot.timestamp,
+            operationCount: snapshot.operations.length,
+            affectedFiles: [
+              ...new Set(
+                snapshot.operations.map((op) => relative(cwd, op.path)),
+              ),
+            ],
+            messageRole: message?.role,
+            messageTimestamp: message?.timestamp,
+            userPrompt,
+          };
+        });
+
+        return {
+          success: true,
+          data: {
+            snapshots: enrichedSnapshots,
+            totalSnapshots: fileSnapshots.length,
+          },
+        };
+      },
+    );
+
     //////////////////////////////////////////////
     // sessions
     this.messageBus.registerHandler(

@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'pathe';
-import type { ApprovalMode } from './config';
+import type { ApprovalMode, SnapshotConfig } from './config';
 import { History } from './history';
 import type { NormalizedMessage } from './message';
 import { Usage } from './usage';
@@ -44,6 +44,22 @@ export class Session {
   }
 }
 
+export type FileOperation = {
+  type: 'create' | 'modify' | 'delete';
+  path: string;
+  source: 'write' | 'edit' | 'bash';
+  content?: string; // For modify: BEFORE content; For create: AFTER content; For delete: old content
+  afterContent?: string; // For modify: AFTER content (the state after this operation)
+};
+
+export type FileSnapshot = {
+  messageUuid: string;
+  parentMessageUuid: string | null; // Support tree structure
+  timestamp: string;
+  operations: FileOperation[];
+  userPrompt?: string; // User prompt that triggered this snapshot
+};
+
 export type SessionConfig = {
   approvalMode?: ApprovalMode;
   approvalTools: string[];
@@ -51,6 +67,8 @@ export type SessionConfig = {
   pastedTextMap?: Record<string, string>;
   pastedImageMap?: Record<string, string>;
   additionalDirectories?: string[];
+  snapshotConfig?: SnapshotConfig;
+  fileSnapshots?: FileSnapshot[]; // Track file changes at each message point
 };
 
 const DEFAULT_SESSION_CONFIG: SessionConfig = {
@@ -59,6 +77,7 @@ const DEFAULT_SESSION_CONFIG: SessionConfig = {
   pastedTextMap: {},
   pastedImageMap: {},
   additionalDirectories: [],
+  fileSnapshots: [],
 };
 
 export class SessionConfigManager {

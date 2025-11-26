@@ -132,7 +132,12 @@ export class Tools {
         isError: true,
       };
     }
-    return await tool.execute(argsObj);
+    const result = await tool.execute(argsObj, argsObj);
+    // Attach the modified rawParams to the result for snapshot tracking
+    if (argsObj) {
+      result._rawParams = argsObj;
+    }
+    return result;
   }
 
   toLanguageV2Tools(): LanguageModelV2FunctionTool[] {
@@ -211,7 +216,10 @@ export interface Tool<TSchema extends z.ZodTypeAny = z.ZodTypeAny> {
     cwd: string;
   }) => string;
   displayName?: string;
-  execute: (params: z.output<TSchema>) => Promise<ToolResult> | ToolResult;
+  execute: (
+    params: z.output<TSchema>,
+    rawParams?: any,
+  ) => Promise<ToolResult> | ToolResult;
   approval?: ToolApprovalInfo;
   parameters: TSchema;
 }
@@ -259,13 +267,18 @@ export type ToolResult = {
   llmContent: string | (TextPart | ImagePart)[];
   returnDisplay?: ReturnDisplay;
   isError?: boolean;
+  _affectedFiles?: string[]; // Internal: files affected by bash tool for snapshot tracking
+  [key: string]: any; // Allow additional internal properties
 };
 
 export function createTool<TSchema extends z.ZodTypeAny>(config: {
   name: string;
   description: string;
   parameters: TSchema;
-  execute: (params: z.output<TSchema>) => Promise<ToolResult> | ToolResult;
+  execute: (
+    params: z.output<TSchema>,
+    rawParams?: any,
+  ) => Promise<ToolResult> | ToolResult;
   approval?: ToolApprovalInfo;
   getDescription?: ({
     params,

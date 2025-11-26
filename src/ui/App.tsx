@@ -7,10 +7,10 @@ import { BackgroundPrompt } from './BackgroundPrompt';
 import { ChatInput } from './ChatInput';
 import { Debug } from './Debug';
 import { ExitHint } from './ExitHint';
-import { ForkModal } from './ForkModal';
 import { Markdown } from './Markdown';
 import { Messages } from './Messages';
 import { QueueDisplay } from './QueueDisplay';
+import { SnapshotModal } from './SnapshotModal';
 import { useAppStore } from './store';
 import { useTerminalRefresh } from './useTerminalRefresh';
 
@@ -71,43 +71,15 @@ function PlanResult() {
 export function App() {
   const { forceRerender } = useTerminalRefresh();
   const {
-    forkModalVisible,
-    messages,
-    fork,
-    hideForkModal,
     forkParentUuid,
-    forkCounter,
-    bridge,
-    sessionId,
-    cwd,
+    restoreCounter,
+    snapshotModalVisible,
+    hideSnapshotModal,
   } = useAppStore();
-  const [forkMessages, setForkMessages] = React.useState<any[]>([]);
-  const [forkLoading, setForkLoading] = React.useState(false);
-  React.useEffect(() => {
-    if (!forkModalVisible) return;
-    if (!bridge || !cwd || !sessionId) {
-      setForkMessages([]);
-      return;
-    }
-    setForkLoading(true);
-    (async () => {
-      try {
-        const res = await bridge.request('session.messages.list', {
-          cwd,
-          sessionId,
-        });
-        setForkMessages(res.data?.messages || []);
-      } catch (_e) {
-        setForkMessages([]);
-      } finally {
-        setForkLoading(false);
-      }
-    })();
-  }, [forkModalVisible, bridge, cwd, sessionId]);
   return (
     <Box
       flexDirection="column"
-      key={`${forceRerender}-${forkParentUuid}-${forkCounter}`}
+      key={`${forceRerender}-${forkParentUuid}-${restoreCounter}`}
     >
       <Messages />
       <BackgroundPrompt />
@@ -117,14 +89,10 @@ export function App() {
       <ChatInput />
       <SlashCommandJSX />
       <ApprovalModal />
-      {forkModalVisible && (
-        <ForkModal
-          messages={forkMessages as any}
-          onSelect={(uuid) => {
-            fork(uuid);
-          }}
+      {snapshotModalVisible && (
+        <SnapshotModal
           onClose={() => {
-            hideForkModal();
+            hideSnapshotModal();
           }}
         />
       )}

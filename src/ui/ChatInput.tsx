@@ -34,11 +34,11 @@ export function ChatInput() {
     queuedMessages,
     status,
     setStatus,
-    showForkModal,
-    forkModalVisible,
     bashBackgroundPrompt,
     bridge,
     thinking,
+    showSnapshotModal,
+    snapshotModalVisible,
   } = useAppStore();
   const { columns } = useTerminalSize();
   const { handleExternalEdit } = useExternalEditor({
@@ -171,7 +171,7 @@ export function ChatInput() {
   if (memoryModal) {
     return <MemoryModal />;
   }
-  if (forkModalVisible) {
+  if (snapshotModalVisible) {
     return null;
   }
   if (status === 'exit') {
@@ -225,7 +225,8 @@ export function ChatInput() {
               }
             }}
             onDoubleEscape={() => {
-              showForkModal();
+              // ESC-ESC triggers snapshot modal
+              showSnapshotModal();
             }}
             onImagePaste={handlers.handleImagePaste}
             onPaste={handlers.handlePaste}

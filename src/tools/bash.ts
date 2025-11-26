@@ -47,8 +47,49 @@ const MAX_TIMEOUT = 10 * 60 * 1000; // 10 minutes
 const BACKGROUND_CHECK_INTERVAL = 500; // ms
 
 /**
- * Truncate output by line count, showing maximum 20 lines
+ * Extract file paths from common file-writing commands
+ * Conservative approach: only track explicit file operations
  */
+function extractAffectedFiles(command: string, cwd: string): string[] {
+  const affectedFiles: string[] = [];
+  const trimmedCmd = command.trim();
+
+  // Pattern matching for common file operations
+  const patterns = [
+    // touch file1 file2
+    { regex: /^touch\s+([^;|&>]+)/, split: true },
+    // echo "content" > file
+    { regex: /(?:echo|cat|printf).*?\s+>\s+([^;|&>]+)/, split: false },
+    // cp source dest
+    { regex: /^cp\s+(?:-[a-z]+\s+)?\S+\s+(\S+)/, split: false },
+    // mv source dest
+    { regex: /^mv\s+(?:-[a-z]+\s+)?\S+\s+(\S+)/, split: false },
+    // mkdir dir1 dir2
+    { regex: /^mkdir\s+(?:-[a-z]+\s+)?([^;|&>]+)/, split: true },
+  ];
+
+  for (const { regex, split } of patterns) {
+    const match = trimmedCmd.match(regex);
+    if (match && match[1]) {
+      const captured = match[1].trim();
+      if (split) {
+        // Multiple files (e.g., touch file1 file2)
+        const files = captured.split(/\s+/).filter(Boolean);
+        affectedFiles.push(...files);
+      } else {
+        // Single file
+        affectedFiles.push(captured);
+      }
+    }
+  }
+
+  // Resolve to absolute paths and remove quotes
+  return affectedFiles
+    .map((f) => f.replace(/["']/g, '').trim())
+    .filter((f) => f && !f.startsWith('-')) // Remove options
+    .map((f) => (path.isAbsolute(f) ? f : path.resolve(cwd, f)));
+}
+
 function truncateOutput(output: string, maxLines: number = 20): string {
   const lines = output.split('\n');
 
@@ -149,8 +190,11 @@ function createBackgroundResult(
   command: string,
   backgroundTaskId: string,
   outputBuffer: string,
+  cwd: string,
 ) {
   const truncated = truncateOutput(outputBuffer);
+  const affectedFiles = extractAffectedFiles(command, cwd);
+
   return {
     shouldReturn: true,
     result: {
@@ -166,6 +210,7 @@ function createBackgroundResult(
         'Use kill_bash tool with task_id to terminate the task.',
       ].join('\n'),
       backgroundTaskId,
+      ...(affectedFiles.length > 0 && { _affectedFiles: affectedFiles }),
     },
   };
 }
@@ -176,6 +221,7 @@ function createBackgroundCheckPromise(
   outputBufferRef: { value: string },
   command: string,
   resultPromise: Promise<any>,
+  cwd: string,
 ) {
   return new Promise<{ shouldReturn: boolean; result: any }>((resolve) => {
     let checkInterval: NodeJS.Timeout | null = null;
@@ -188,6 +234,7 @@ function createBackgroundCheckPromise(
             command,
             backgroundTaskIdRef.value,
             outputBufferRef.value,
+            cwd,
           ),
         );
       }
@@ -246,7 +293,8 @@ function formatExecutionResult(
   wrappedCommand: string,
   cwd: string,
   backgroundPIDs: number[],
-): { llmContent: string; returnDisplay: string } {
+  affectedFiles: string[],
+): { llmContent: string; returnDisplay: string; _affectedFiles?: string[] } {
   let llmContent = '';
   if (result.cancelled) {
     llmContent = 'Command execution timed out and was cancelled.';
@@ -305,7 +353,11 @@ function formatExecutionResult(
     }
   }
 
-  return { llmContent, returnDisplay: message };
+  return {
+    llmContent,
+    returnDisplay: message,
+    ...(affectedFiles.length > 0 && { _affectedFiles: affectedFiles }),
+  };
 }
 
 async function executeCommand(
@@ -491,6 +543,7 @@ async function executeCommand(
         outputBufferRef,
         command,
         resultPromise,
+        cwd,
       ),
       resultPromise.then(() => ({ shouldReturn: false, result: null })),
     ]);
@@ -527,12 +580,17 @@ async function executeCommand(
     }
   }
 
+  // Extract affected files for snapshot tracking
+  const affectedFiles =
+    result.exitCode === 0 ? extractAffectedFiles(command, cwd) : [];
+
   return formatExecutionResult(
     result,
     command,
     wrappedCommand,
     cwd,
     backgroundPIDs,
+    affectedFiles,
   );
 }
 

@@ -14,6 +14,7 @@ import type { ApprovalCategory, Tool, ToolUse } from './tool';
 import { resolveTools, Tools } from './tool';
 import type { Usage } from './usage';
 import { randomUUID } from './utils/randomUUID';
+import { cleanOldSnapshots, TurnSnapshotCollector } from './utils/snapshot';
 
 export class Project {
   session: Session;
@@ -246,6 +247,13 @@ export class Project {
         : [userMessage];
     const filteredInput = input.filter((message) => message !== null);
     const toolsManager = new Tools(tools);
+
+    // Create snapshot collector
+    const snapshotEnabled = this.context.config.snapshot?.enabled !== false;
+    const snapshotCollector = snapshotEnabled
+      ? new TurnSnapshotCollector(this.context.cwd)
+      : undefined;
+
     const result = await runLoop({
       input: filteredInput,
       model,
@@ -367,9 +375,6 @@ export class Project {
           }
         }
         // 4. if category is edit check autoEdit config (including session config)
-        const sessionConfigManager = new SessionConfigManager({
-          logPath: this.context.paths.getSessionLogPath(this.session.id),
-        });
         if (tool.approval?.category === 'write') {
           if (
             sessionConfigManager.config.approvalMode === 'autoEdit' ||
@@ -390,6 +395,7 @@ export class Project {
           })) ?? false
         );
       },
+      snapshotCollector,
     });
     const endTime = new Date();
     await this.context.apply({
@@ -412,6 +418,41 @@ export class Project {
     if (result.success && result.data.history) {
       this.session.updateHistory(result.data.history);
     }
+
+    // Save snapshot after turn completion
+    if (snapshotCollector && result.success) {
+      // CRITICAL: Reload config to get latest state after potential restore operations
+      // The restore operation in nodeBridge.ts may have modified the log file
+      sessionConfigManager.config = sessionConfigManager.load(
+        this.context.paths.getSessionLogPath(this.session.id),
+      );
+
+      const lastMessage =
+        result.data.history.messages[result.data.history.messages.length - 1];
+      if (lastMessage && 'uuid' in lastMessage && 'parentUuid' in lastMessage) {
+        const userPromptText =
+          message !== null && typeof message === 'string' ? message : undefined;
+
+        const snapshot = snapshotCollector.createSnapshot(
+          (lastMessage as NormalizedMessage).uuid,
+          (lastMessage as NormalizedMessage).parentUuid,
+          userPromptText,
+        );
+
+        if (snapshot) {
+          const snapshots = sessionConfigManager.config.fileSnapshots || [];
+          snapshots.push(snapshot);
+
+          const maxSnapshots = this.context.config.snapshot?.maxSnapshots || 50;
+          sessionConfigManager.config.fileSnapshots = cleanOldSnapshots(
+            snapshots,
+            maxSnapshots,
+          );
+          sessionConfigManager.write();
+        }
+      }
+    }
+
     return result;
   }
 }

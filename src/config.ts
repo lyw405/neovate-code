@@ -37,6 +37,12 @@ export type CommitConfig = {
   model?: string;
 };
 
+export type SnapshotConfig = {
+  enabled?: boolean;
+  maxSnapshots?: number;
+  maxFileSize?: number; // in bytes
+};
+
 export type ProviderConfig = Partial<Omit<Provider, 'createModel'>>;
 
 export type Config = {
@@ -64,6 +70,7 @@ export type Config = {
   autoUpdate?: boolean;
   browser?: boolean;
   temperature?: number;
+  snapshot?: SnapshotConfig;
 };
 
 const DEFAULT_CONFIG: Partial<Config> = {
@@ -78,6 +85,11 @@ const DEFAULT_CONFIG: Partial<Config> = {
   outputFormat: 'text',
   autoUpdate: true,
   browser: false,
+  snapshot: {
+    enabled: true,
+    maxSnapshots: 50,
+    maxFileSize: 512000, // 500KB
+  },
 };
 const VALID_CONFIG_KEYS = [
   ...Object.keys(DEFAULT_CONFIG),
@@ -93,9 +105,10 @@ const VALID_CONFIG_KEYS = [
   'provider',
   'browser',
   'temperature',
+  'snapshot',
 ];
 const ARRAY_CONFIG_KEYS = ['plugins'];
-const OBJECT_CONFIG_KEYS = ['mcpServers', 'commit', 'provider'];
+const OBJECT_CONFIG_KEYS = ['mcpServers', 'commit', 'provider', 'snapshot'];
 const BOOLEAN_CONFIG_KEYS = [
   'quiet',
   'todo',

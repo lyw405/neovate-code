@@ -193,7 +193,7 @@ export function pairToolsWithResults(
 }
 
 export function Messages() {
-  const { userName, messages, productName, sessionId, forkCounter } =
+  const { userName, messages, productName, sessionId, restoreCounter } =
     useAppStore();
 
   // Split messages into completed and pending
@@ -202,27 +202,26 @@ export function Messages() {
     [messages],
   );
 
+  // Only show header when there are no messages (new session)
+  const shouldShowHeader =
+    completedMessages.length === 0 && pendingMessages.length === 0;
+
   return (
     <Box flexDirection="column">
+      {/* Header - only show for new/empty sessions */}
+      {shouldShowHeader && <Header />}
+
       {/* Static area - completed messages */}
-      <Static
-        key={`${sessionId}-${forkCounter}`}
-        items={['header', ...completedMessages] as any[]}
-      >
-        {(item, index) => {
-          if (item === 'header') {
-            return <Header key="header" />;
-          }
-          return (
-            <MessageGroup
-              key={index}
-              message={item}
-              messages={completedMessages}
-              productName={productName}
-              userName={userName}
-            />
-          );
-        }}
+      <Static key={`${sessionId}-${restoreCounter}`} items={completedMessages}>
+        {(item, index) => (
+          <MessageGroup
+            key={index}
+            message={item}
+            messages={completedMessages}
+            productName={productName}
+            userName={userName}
+          />
+        )}
       </Static>
 
       {/* Dynamic area - pending messages */}
@@ -390,17 +389,25 @@ function User({
   if (message.hidden) {
     return null;
   }
+
+  // Check if this is a system notification (has uiContent)
+  const isSystemNotification = 'uiContent' in message && message.uiContent;
+
   return (
     <Box
       flexDirection="column"
       marginTop={SPACING.MESSAGE_MARGIN_TOP}
-      marginLeft={SPACING.MESSAGE_MARGIN_LEFT_USER}
+      marginLeft={isSystemNotification ? 0 : SPACING.MESSAGE_MARGIN_LEFT_USER}
     >
-      <Text bold color={UI_COLORS.USER}>
-        {userName}
-      </Text>
+      {!isSystemNotification && (
+        <Text bold color={UI_COLORS.USER}>
+          {userName}
+        </Text>
+      )}
       {isCanceled ? (
         <Text color={UI_COLORS.CANCELED}>User canceled the request</Text>
+      ) : isSystemNotification ? (
+        <Text color="cyan">{text}</Text>
       ) : (
         <Box>
           <Text backgroundColor="#555555" color="#cdcdcd">

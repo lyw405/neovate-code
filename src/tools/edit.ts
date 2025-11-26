@@ -30,13 +30,26 @@ Usage:
       }
       return path.relative(cwd, params.file_path);
     },
-    execute: async ({ file_path, old_string, new_string }) => {
+    execute: async ({ file_path, old_string, new_string }, rawParams) => {
       try {
         const cwd = opts.cwd;
         const fullFilePath = path.isAbsolute(file_path)
           ? file_path
           : path.resolve(cwd, file_path);
         const relativeFilePath = path.relative(cwd, fullFilePath);
+
+        const fileExists = fs.existsSync(fullFilePath);
+
+        // Store old content for snapshot tracking
+        if (rawParams && fileExists) {
+          try {
+            const beforeContent = fs.readFileSync(fullFilePath, 'utf-8');
+            (rawParams as any)._beforeContent = beforeContent;
+          } catch {
+            // Ignore read errors
+          }
+        }
+
         const { patch, updatedFile } = applyEdit(
           cwd,
           fullFilePath,
