@@ -48,8 +48,21 @@ export type FileOperation = {
   type: 'create' | 'modify' | 'delete';
   path: string;
   source: 'write' | 'edit' | 'bash';
-  content?: string; // For modify: BEFORE content; For create: AFTER content; For delete: old content
-  afterContent?: string; // For modify: AFTER content (the state after this operation)
+  /**
+   * Content field semantics depend on the operation type:
+   * - For 'modify': BEFORE content (the state before this modification)
+   * - For 'create': AFTER content (the state after creation)
+   * - For 'delete': The content of the deleted file (for potential restoration)
+   *
+   * IMPORTANT: When used in restore operations from buildRestoreOperations,
+   * 'content' represents the TARGET state we want to restore to.
+   */
+  content?: string;
+  /**
+   * AFTER content - only used for 'modify' operations
+   * Represents the state after the modification was applied
+   */
+  afterContent?: string;
 };
 
 export type FileSnapshot = {

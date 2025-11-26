@@ -27,82 +27,6 @@ const DEFAULT_ERROR_RETRY_TURNS = 10;
 
 const debug = createDebug('neovate:loop');
 
-/**
- * Collect file snapshot for tool operations
- */
-async function collectFileSnapshot(
-  snapshotCollector: TurnSnapshotCollector,
-  toolUse: ToolUse,
-  toolResult: ToolResult,
-  cwd: string,
-): Promise<void> {
-  try {
-    if (toolUse.name === 'write' || toolUse.name === 'edit') {
-      const filePath = toolUse.params.file_path;
-      if (filePath && typeof filePath === 'string') {
-        const fs = await import('fs');
-        const path = await import('pathe');
-        const absolutePath = path.isAbsolute(filePath)
-          ? filePath
-          : path.resolve(cwd, filePath);
-
-        // Get beforeContent from toolResult._rawParams (set by tool.invoke)
-        const beforeContent = toolResult._rawParams?._beforeContent as
-          | string
-          | undefined;
-        const beforeExists = beforeContent !== undefined;
-
-        const fileExists = fs.existsSync(absolutePath);
-        const content = fileExists
-          ? fs.readFileSync(absolutePath, 'utf-8')
-          : undefined;
-
-        if (beforeExists && !fileExists) {
-          snapshotCollector.addOperation({
-            type: 'delete',
-            path: filePath,
-            source: toolUse.name as 'write' | 'edit',
-            content: beforeContent,
-          });
-        } else {
-          snapshotCollector.addOperation({
-            type: beforeExists ? 'modify' : 'create',
-            path: filePath,
-            source: toolUse.name as 'write' | 'edit',
-            // For modify: store BEFORE content in 'content' and AFTER content in 'afterContent'
-            // For create: store AFTER content in 'content'
-            content: beforeExists ? beforeContent : content,
-            afterContent: beforeExists ? content : undefined,
-          });
-        }
-      }
-    } else if (toolUse.name === 'bash') {
-      const bashFiles = toolResult._affectedFiles as string[] | undefined;
-      if (bashFiles && Array.isArray(bashFiles)) {
-        const fs = await import('fs');
-        const path = await import('pathe');
-        for (const filePath of bashFiles) {
-          const absolutePath = path.isAbsolute(filePath)
-            ? filePath
-            : path.resolve(cwd, filePath);
-
-          if (fs.existsSync(absolutePath)) {
-            const content = fs.readFileSync(absolutePath, 'utf-8');
-            snapshotCollector.addOperation({
-              type: 'create',
-              path: filePath,
-              source: 'bash',
-              content,
-            });
-          }
-        }
-      }
-    }
-  } catch (error) {
-    console.error('Failed to collect snapshot:', error);
-  }
-}
-
 async function exponentialBackoffWithCancellation(
   attempt: number,
   signal?: AbortSignal,
@@ -550,11 +474,9 @@ export async function runLoop(opts: RunLoopOpts): Promise<LoopResult> {
 
         // Collect file snapshot for write/edit/bash tools
         if (opts.snapshotCollector && !toolResult.isError) {
-          await collectFileSnapshot(
-            opts.snapshotCollector,
+          await opts.snapshotCollector.collectFromToolResult(
             toolUse,
             toolResult,
-            opts.cwd,
           );
         }
         toolResults.push({

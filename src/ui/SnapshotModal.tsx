@@ -20,7 +20,7 @@ interface SnapshotModalProps {
 }
 
 export function SnapshotModal({ onClose }: SnapshotModalProps) {
-  const { bridge, cwd, sessionId, log } = useAppStore();
+  const { bridge, cwd, sessionId, log, isRestoringSnapshot } = useAppStore();
   const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -188,6 +188,11 @@ export function SnapshotModal({ onClose }: SnapshotModalProps) {
           Restore code and conversation to before selected snapshot
         </Text>
       </Box>
+      {isRestoringSnapshot && (
+        <Box marginBottom={1}>
+          <Text color="yellow">⏳ Restoring snapshot, please wait...</Text>
+        </Box>
+      )}
       <Box marginBottom={1}>
         <Text color="gray">
           {'  '}

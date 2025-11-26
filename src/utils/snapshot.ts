@@ -29,11 +29,112 @@ export class TurnSnapshotCollector {
       ? operation.path
       : path.resolve(this.cwd, operation.path);
 
-    // Store with absolute path as key to handle duplicates
+    // Convert to relative path for storage to avoid path issues when cwd changes
+    const relativePath = path.relative(this.cwd, absolutePath);
+
+    // Store with relative path to ensure portability
     this.operations.set(absolutePath, {
       ...operation,
-      path: absolutePath,
+      path: relativePath,
     });
+  }
+
+  /**
+   * Collect file snapshot from tool execution result
+   * This is the main entry point for collecting snapshots
+   */
+  async collectFromToolResult(
+    toolUse: { name: string; params: Record<string, any> },
+    toolResult: { _rawParams?: Record<string, any>; _affectedFiles?: string[] },
+  ): Promise<void> {
+    try {
+      if (toolUse.name === 'write' || toolUse.name === 'edit') {
+        await this.collectFromFileModificationTool(toolUse, toolResult);
+      } else if (toolUse.name === 'bash') {
+        await this.collectFromBashTool(toolResult);
+      }
+    } catch (error) {
+      console.error('Failed to collect snapshot:', error);
+    }
+  }
+
+  /**
+   * Collect snapshot from write/edit tool
+   */
+  private async collectFromFileModificationTool(
+    toolUse: { name: string; params: Record<string, any> },
+    toolResult: { _rawParams?: Record<string, any> },
+  ): Promise<void> {
+    const filePath = toolUse.params.file_path;
+    if (!filePath || typeof filePath !== 'string') {
+      return;
+    }
+
+    const absolutePath = path.isAbsolute(filePath)
+      ? filePath
+      : path.resolve(this.cwd, filePath);
+
+    // Get beforeContent from toolResult._rawParams (set by tool.invoke)
+    const beforeContent = toolResult._rawParams?._beforeContent as
+      | string
+      | undefined;
+    const beforeExists = beforeContent !== undefined;
+
+    const fileExists = fs.existsSync(absolutePath);
+    const afterContent = fileExists
+      ? fs.readFileSync(absolutePath, 'utf-8')
+      : undefined;
+
+    // Determine operation type based on before/after state
+    if (beforeExists && !fileExists) {
+      // File was deleted
+      this.addOperation({
+        type: 'delete',
+        path: filePath,
+        source: toolUse.name as 'write' | 'edit',
+        content: beforeContent,
+      });
+    } else {
+      // File was created or modified
+      this.addOperation({
+        type: beforeExists ? 'modify' : 'create',
+        path: filePath,
+        source: toolUse.name as 'write' | 'edit',
+        // For modify: store BEFORE content in 'content' and AFTER content in 'afterContent'
+        // For create: store AFTER content in 'content'
+        content: beforeExists ? beforeContent : afterContent,
+        afterContent: beforeExists ? afterContent : undefined,
+      });
+    }
+  }
+
+  /**
+   * Collect snapshot from bash tool
+   * Note: bash only records AFTER state, cannot be fully reverted
+   */
+  private async collectFromBashTool(toolResult: {
+    _affectedFiles?: string[];
+  }): Promise<void> {
+    const bashFiles = toolResult._affectedFiles;
+    if (!bashFiles || !Array.isArray(bashFiles)) {
+      return;
+    }
+
+    for (const filePath of bashFiles) {
+      const absolutePath = path.isAbsolute(filePath)
+        ? filePath
+        : path.resolve(this.cwd, filePath);
+
+      if (fs.existsSync(absolutePath)) {
+        const content = fs.readFileSync(absolutePath, 'utf-8');
+        this.addOperation({
+          type: 'create',
+          path: filePath,
+          source: 'bash',
+          content,
+        });
+      }
+    }
   }
 
   /**
@@ -126,6 +227,12 @@ export function restoreFilesFromOperations(
     errors: [],
   };
 
+  // Phase 1: Pre-check and filter operations
+  const operationsToExecute: Array<{
+    operation: FileOperation;
+    absolutePath: string;
+  }> = [];
+
   for (const operation of operations) {
     try {
       const absolutePath = path.isAbsolute(operation.path)
@@ -144,104 +251,52 @@ export function restoreFilesFromOperations(
         continue;
       }
 
-      // Apply operation
-      switch (operation.type) {
-        case 'create':
-        case 'modify':
-          if (
-            operation.content !== undefined ||
-            operation.afterContent !== undefined
-          ) {
-            const dir = path.dirname(absolutePath);
-            if (!fs.existsSync(dir)) {
-              fs.mkdirSync(dir, { recursive: true });
-            }
-            // For modify operations, use afterContent (state after operation)
-            // For create operations, use content (which is already the after state)
-            const contentToWrite =
-              operation.type === 'modify' &&
-              operation.afterContent !== undefined
-                ? operation.afterContent
-                : operation.content;
-            if (contentToWrite !== undefined) {
-              fs.writeFileSync(absolutePath, contentToWrite, 'utf-8');
-              result.restoredFiles.push(operation.path);
-            }
-          }
-          break;
-
-        case 'delete':
-          if (fs.existsSync(absolutePath)) {
-            fs.unlinkSync(absolutePath);
-            result.restoredFiles.push(operation.path);
-          }
-          break;
+      // Pre-check: Verify operation is feasible
+      if (operation.type === 'create' || operation.type === 'modify') {
+        const dir = path.dirname(absolutePath);
+        if (!fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+        // Check write permission
+        try {
+          fs.accessSync(dir, fs.constants.W_OK);
+        } catch (permError) {
+          result.success = false;
+          result.errors.push({
+            file: operation.path,
+            error: `No write permission for directory: ${dir}`,
+          });
+          continue;
+        }
       }
+
+      operationsToExecute.push({ operation, absolutePath });
     } catch (error) {
       result.success = false;
       result.errors.push({
         file: operation.path,
-        error: error instanceof Error ? error.message : String(error),
+        error: `Pre-check failed: ${error instanceof Error ? error.message : String(error)}`,
       });
     }
   }
 
-  return result;
-}
+  // If pre-check failed, return immediately
+  if (!result.success) {
+    return result;
+  }
 
-/**
- * Revert snapshot operations (undo the changes)
- * This is used when restoring to BEFORE a snapshot
- */
-export function revertSnapshotOperations(
-  operations: FileOperation[],
-  cwd: string,
-  maxFileSize?: number,
-): RestoreResult {
-  const result: RestoreResult = {
-    success: true,
-    restoredFiles: [],
-    skippedBashFiles: [],
-    skippedLargeFiles: [],
-    errors: [],
-  };
-
-  for (const operation of operations) {
+  // Phase 2: Execute operations
+  for (const { operation, absolutePath } of operationsToExecute) {
     try {
-      const absolutePath = path.isAbsolute(operation.path)
-        ? operation.path
-        : path.resolve(cwd, operation.path);
-
-      // Skip bash tool files
-      if (operation.source === 'bash') {
-        result.skippedBashFiles.push(operation.path);
-        continue;
-      }
-
-      // Skip if file is too large
-      if (!shouldTrackFile(absolutePath, maxFileSize)) {
-        result.skippedLargeFiles.push(operation.path);
-        continue;
-      }
-
-      // Revert operation (inverse logic)
+      // Apply operation
+      // CRITICAL: Operations from buildRestoreOperations/buildSnapshotPath represent
+      // the CUMULATIVE state we want to restore to.
+      // - For 'create': content = the final state after creation
+      // - For 'modify': afterContent = the final state after all modifications
+      // - For 'delete': delete the file
       switch (operation.type) {
         case 'create':
-          // Undo create = delete the file
-          if (fs.existsSync(absolutePath)) {
-            fs.unlinkSync(absolutePath);
-            result.restoredFiles.push(operation.path);
-          }
-          break;
-
-        case 'modify':
-          // Undo modify = no-op (will be restored by parent operations)
-          // We don't need to do anything here because the parent's state
-          // will be applied by restoreFilesFromOperations
-          break;
-
-        case 'delete':
-          // Undo delete = restore the file with old content
+          // Create/overwrite file with the create content
           if (operation.content !== undefined) {
             const dir = path.dirname(absolutePath);
             if (!fs.existsSync(dir)) {
@@ -251,13 +306,55 @@ export function revertSnapshotOperations(
             result.restoredFiles.push(operation.path);
           }
           break;
+
+        case 'modify':
+          // For modify: we want the FINAL state which is in afterContent
+          // (The cumulative result of all modifications up to this point)
+          if (operation.afterContent !== undefined) {
+            const dir = path.dirname(absolutePath);
+            if (!fs.existsSync(dir)) {
+              fs.mkdirSync(dir, { recursive: true });
+            }
+            fs.writeFileSync(absolutePath, operation.afterContent, 'utf-8');
+            result.restoredFiles.push(operation.path);
+          } else if (operation.content !== undefined) {
+            // Fallback: if no afterContent, use content
+            const dir = path.dirname(absolutePath);
+            if (!fs.existsSync(dir)) {
+              fs.mkdirSync(dir, { recursive: true });
+            }
+            fs.writeFileSync(absolutePath, operation.content, 'utf-8');
+            result.restoredFiles.push(operation.path);
+          }
+          break;
+
+        case 'delete':
+          if (fs.existsSync(absolutePath)) {
+            fs.unlinkSync(absolutePath);
+            result.restoredFiles.push(operation.path);
+
+            // Clean up empty parent directories
+            const dir = path.dirname(absolutePath);
+            try {
+              if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) {
+                fs.rmdirSync(dir);
+              }
+            } catch {
+              // Ignore directory cleanup errors
+            }
+          }
+          break;
       }
     } catch (error) {
+      // CRITICAL: If any operation fails, mark as failed and stop immediately
+      // Don't continue with remaining operations to avoid inconsistent state
       result.success = false;
       result.errors.push({
         file: operation.path,
         error: error instanceof Error ? error.message : String(error),
       });
+      // Stop processing immediately on first error
+      break;
     }
   }
 
@@ -267,6 +364,10 @@ export function revertSnapshotOperations(
 /**
  * Build restore operations for snapshot rollback
  * Returns operations to restore to the state BEFORE target snapshot
+ *
+ * CRITICAL: Handles two cases differently:
+ * 1. First snapshot (no parent): Revert the snapshot's operations
+ * 2. Other snapshots: Restore to parent state + clean up files created after
  */
 export function buildRestoreOperations(
   snapshots: FileSnapshot[],
@@ -293,25 +394,32 @@ export function buildRestoreOperations(
   );
   const parentFiles = new Set(parentOperations.map((op) => op.path));
 
-  // Special handling: If parent state is empty (first snapshot case)
+  // CRITICAL: Determine if this is the first snapshot
+  // A snapshot is "first" if:
+  // 1. It has no parent (parentMessageUuid === null), OR
+  // 2. No parent snapshot exists in the chain
   const isFirstSnapshot = parentOperations.length === 0;
 
   let restoreOperations: FileOperation[];
 
   if (isFirstSnapshot) {
-    // For the first snapshot, we restore based on the snapshot's operations themselves
+    // === CASE 1: First Snapshot ===
+    // Restore to project initial state by REVERTING the snapshot's operations
+    // Example: If snapshot created file.txt, we delete it
+    //          If snapshot modified file.txt from A->B, we restore to A
+    //          If snapshot deleted file.txt, we restore it
     restoreOperations = [];
 
     for (const op of targetSnapshot.operations) {
       if (op.type === 'create') {
-        // Created file should be deleted when rolling back
+        // Revert create -> delete the file
         restoreOperations.push({
           type: 'delete',
           path: op.path,
           source: 'write',
         });
       } else if (op.type === 'modify') {
-        // Modified file should be restored to before content
+        // Revert modify -> restore to BEFORE content
         restoreOperations.push({
           type: 'create', // Use create to restore the before content
           path: op.path,
@@ -319,7 +427,7 @@ export function buildRestoreOperations(
           source: op.source,
         });
       } else if (op.type === 'delete') {
-        // Deleted file should be restored
+        // Revert delete -> restore the file
         if (op.content) {
           restoreOperations.push({
             type: 'create',
@@ -331,26 +439,34 @@ export function buildRestoreOperations(
       }
     }
   } else {
-    // Normal case: restore to parent state and clean up files created after
+    // === CASE 2: Non-first Snapshot ===
+    // Restore to parent state + clean up files created after target
+    // Example: Parent has file1.txt, target created file2.txt
+    //          We restore file1.txt to parent state, delete file2.txt
+
+    // Step 2.1: Find all files that were created/modified at or after target time
     const filesToDelete = new Set<string>();
+    const filesInTargetOrLater = new Set<string>();
+
     for (const snapshot of snapshots) {
       const snapshotTime = new Date(snapshot.timestamp).getTime();
 
       if (snapshotTime >= targetTime) {
         for (const op of snapshot.operations) {
-          // Track files that appear in target or later (create/modify)
-          // We'll delete them if they don't exist in parent state
-          if (
-            (op.type === 'create' || op.type === 'modify') &&
-            !parentFiles.has(op.path)
-          ) {
-            filesToDelete.add(op.path);
+          // Track all files touched in target or later snapshots
+          if (op.type === 'create' || op.type === 'modify') {
+            filesInTargetOrLater.add(op.path);
+
+            // If file doesn't exist in parent state, mark for deletion
+            if (!parentFiles.has(op.path)) {
+              filesToDelete.add(op.path);
+            }
           }
         }
       }
     }
 
-    // Step 3: Combine parent operations + delete operations
+    // Step 2.2: Combine parent operations + delete operations
     restoreOperations = [...parentOperations];
 
     // Add delete operations for files created after parent
@@ -391,13 +507,17 @@ export function buildSnapshotPath(
     return [];
   }
 
+  // Create messageMap once at the beginning if messages are provided
+  const messageMap = messages
+    ? new Map(messages.map((m: any) => [m.uuid, m]))
+    : null;
+
   // Find the parent snapshot by walking up the message tree
   // The parent message might not have a snapshot (e.g., tool messages, user messages)
   // So we need to find the nearest ancestor message that has a snapshot
   let parentSnapshot: FileSnapshot | undefined;
 
-  if (messages) {
-    const messageMap = new Map(messages.map((m: any) => [m.uuid, m]));
+  if (messageMap) {
     let currentMessageUuid = targetSnapshot.parentMessageUuid;
 
     while (currentMessageUuid) {
@@ -434,6 +554,8 @@ export function buildSnapshotPath(
   const path: FileSnapshot[] = [];
   let current: FileSnapshot | undefined = parentSnapshot;
 
+  // Reuse messageMap created above
+
   while (current) {
     path.unshift(current);
 
@@ -444,8 +566,7 @@ export function buildSnapshotPath(
 
     // Find next parent snapshot using message tree if available
     let nextParent: FileSnapshot | undefined;
-    if (messages) {
-      const messageMap = new Map(messages.map((m: any) => [m.uuid, m]));
+    if (messageMap) {
       let parentMessageUuid = current.parentMessageUuid;
 
       // Walk up the message tree to find the next snapshot
@@ -481,31 +602,88 @@ export function buildSnapshotPath(
   }
 
   // Merge operations, keeping final state for each file
+  // CRITICAL: Handle all operation combinations correctly
+  // The goal is to build the cumulative state from root to parent
   const finalOperations = new Map<string, FileOperation>();
 
   for (const snapshot of path) {
     for (const operation of snapshot.operations) {
       const key = operation.path;
 
-      // Handle operation merging
       const existing = finalOperations.get(key);
       if (existing) {
-        // create + delete = file doesn't exist
+        // Handle operation merging based on type combinations
+
         if (existing.type === 'create' && operation.type === 'delete') {
+          // create + delete = file doesn't exist
           finalOperations.delete(key);
           continue;
         }
-        // modify + delete = file doesn't exist
+
         if (existing.type === 'modify' && operation.type === 'delete') {
+          // modify + delete = file doesn't exist
           finalOperations.delete(key);
           continue;
         }
-        // delete + create = file exists with new content
-        // delete + modify = file exists with new content
-        // Just keep the latest operation (create/modify will override delete)
+
+        if (existing.type === 'create' && operation.type === 'modify') {
+          // create + modify = create with the FINAL afterContent
+          // The file was created (existing.content = AFTER state of creation)
+          // Then modified (operation.afterContent = final state)
+          finalOperations.set(key, {
+            type: 'create',
+            path: operation.path,
+            content: operation.afterContent, // Use the final modified state
+            source: operation.source,
+          });
+          continue;
+        }
+
+        if (existing.type === 'modify' && operation.type === 'modify') {
+          // modify + modify = modify with FIRST before and LAST after
+          // First modify: A -> B (content=A, afterContent=B)
+          // Second modify: B -> C (content=B, afterContent=C)
+          // Result: A -> C (content=A, afterContent=C)
+          finalOperations.set(key, {
+            type: 'modify',
+            path: operation.path,
+            content: existing.content, // Keep the FIRST before content (original state)
+            afterContent: operation.afterContent, // Use the LAST after content (final state)
+            source: operation.source,
+          });
+          continue;
+        }
+
+        if (existing.type === 'delete' && operation.type === 'create') {
+          // delete + create = file exists with new content
+          // Treat as a create operation with the new content
+          finalOperations.set(key, {
+            type: 'create',
+            path: operation.path,
+            content: operation.content, // The new content
+            source: operation.source,
+          });
+          continue;
+        }
+
+        if (existing.type === 'delete' && operation.type === 'modify') {
+          // delete + modify = file exists with modified content
+          // This is unusual but possible if file was deleted then recreated and modified
+          // Treat as create with the final afterContent
+          finalOperations.set(key, {
+            type: 'create',
+            path: operation.path,
+            content: operation.afterContent, // The final modified content
+            source: operation.source,
+          });
+          continue;
+        }
+
+        // For other combinations, keep the latest operation
+        // This handles: create+create (impossible), modify+create (unusual), etc.
       }
 
-      // Keep latest operation
+      // Keep latest operation (or first operation if no existing)
       finalOperations.set(key, operation);
     }
   }
@@ -514,7 +692,9 @@ export function buildSnapshotPath(
 }
 
 /**
- * Clean old snapshots using FIFO strategy
+ * Clean old snapshots using smart strategy
+ * Preserves snapshot chain integrity by keeping snapshots from newest backwards
+ * following the parent chain, rather than just by timestamp
  */
 export function cleanOldSnapshots(
   snapshots: FileSnapshot[],
@@ -524,11 +704,47 @@ export function cleanOldSnapshots(
     return snapshots;
   }
 
-  // Sort by timestamp and keep the most recent ones
-  return snapshots
-    .sort(
-      (a, b) =>
-        new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
-    )
-    .slice(0, maxSnapshots);
+  // Sort by timestamp descending (newest first)
+  const sorted = [...snapshots].sort(
+    (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+  );
+
+  // Build snapshot map for quick lookup
+  const snapshotMap = new Map<string, FileSnapshot>();
+  for (const snapshot of snapshots) {
+    snapshotMap.set(snapshot.messageUuid, snapshot);
+  }
+
+  // Keep snapshots by following parent chain from newest
+  const toKeep = new Set<string>();
+  let count = 0;
+
+  // Start from the newest snapshot and walk backwards following parent chain
+  for (const snapshot of sorted) {
+    if (count >= maxSnapshots) {
+      break;
+    }
+
+    // Add this snapshot
+    toKeep.add(snapshot.messageUuid);
+    count++;
+
+    // Also add all its ancestors to maintain chain integrity
+    // (but don't count them towards the limit if already added)
+    let current = snapshot;
+    while (current.parentMessageUuid && count < maxSnapshots) {
+      const parent = snapshotMap.get(current.parentMessageUuid);
+      if (!parent) {
+        break;
+      }
+      if (!toKeep.has(parent.messageUuid)) {
+        toKeep.add(parent.messageUuid);
+        count++;
+      }
+      current = parent;
+    }
+  }
+
+  // Return snapshots that should be kept, preserving original order
+  return snapshots.filter((s) => toKeep.has(s.messageUuid));
 }

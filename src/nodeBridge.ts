@@ -1702,11 +1702,28 @@ class NodeHandlerRegistry {
         // Restore to target's parent state
         const result = restoreFilesFromOperations(operations, cwd, maxFileSize);
 
-        // Clear conversation history and snapshots
+        // CRITICAL: Only clean history if file restoration is completely successful
+        // If restoration fails, keep snapshots and history intact for retry
+        if (!result.success || result.errors.length > 0) {
+          return {
+            success: false,
+            data: {
+              restoredFiles: result.restoredFiles,
+              skippedBashFiles: result.skippedBashFiles,
+              skippedLargeFiles: result.skippedLargeFiles,
+              errors: result.errors,
+              userPromptToFill: undefined,
+            },
+            error: {
+              message: `File restoration failed: ${result.errors.map((e) => e.error).join('; ')}. Snapshots and history preserved for retry.`,
+            },
+          };
+        }
+
+        // File restoration succeeded, now clean conversation history and snapshots
         try {
-          const messages = loadSessionMessages({
-            logPath: context.paths.getSessionLogPath(sessionId),
-          });
+          // Reuse already loaded messages (no need to reload)
+          // const messages is already available from line 1663
 
           // Find the target message to get timestamp and parent
           const targetMessage = messages.find(
@@ -1819,27 +1836,35 @@ class NodeHandlerRegistry {
           );
         } catch (error) {
           // If clearing history fails, just log the error but still return success
+          // Files have been restored successfully
           console.error(
             'Failed to clear conversation history after restore:',
             error,
           );
+          return {
+            success: true,
+            data: {
+              restoredFiles: result.restoredFiles,
+              skippedBashFiles: result.skippedBashFiles,
+              skippedLargeFiles: result.skippedLargeFiles,
+              errors: [],
+              userPromptToFill,
+            },
+            warning:
+              'Files restored successfully but history cleanup failed. Please reload the session.',
+          };
         }
 
+        // Success: return restored file information
         return {
-          success: result.success,
+          success: true,
           data: {
             restoredFiles: result.restoredFiles,
             skippedBashFiles: result.skippedBashFiles,
             skippedLargeFiles: result.skippedLargeFiles,
-            errors: result.errors,
+            errors: [],
             userPromptToFill,
           },
-          error:
-            result.errors.length > 0
-              ? {
-                  message: result.errors.map((e) => e.error).join('; '),
-                }
-              : undefined,
         };
       },
     );

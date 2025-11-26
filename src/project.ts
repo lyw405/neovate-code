@@ -421,35 +421,47 @@ export class Project {
 
     // Save snapshot after turn completion
     if (snapshotCollector && result.success) {
-      // CRITICAL: Reload config to get latest state after potential restore operations
-      // The restore operation in nodeBridge.ts may have modified the log file
-      sessionConfigManager.config = sessionConfigManager.load(
-        this.context.paths.getSessionLogPath(this.session.id),
-      );
-
-      const lastMessage =
-        result.data.history.messages[result.data.history.messages.length - 1];
-      if (lastMessage && 'uuid' in lastMessage && 'parentUuid' in lastMessage) {
-        const userPromptText =
-          message !== null && typeof message === 'string' ? message : undefined;
-
-        const snapshot = snapshotCollector.createSnapshot(
-          (lastMessage as NormalizedMessage).uuid,
-          (lastMessage as NormalizedMessage).parentUuid,
-          userPromptText,
+      try {
+        // CRITICAL: Reload config to get latest state after potential restore operations
+        // The restore operation in nodeBridge.ts may have modified the log file
+        sessionConfigManager.config = sessionConfigManager.load(
+          this.context.paths.getSessionLogPath(this.session.id),
         );
 
-        if (snapshot) {
-          const snapshots = sessionConfigManager.config.fileSnapshots || [];
-          snapshots.push(snapshot);
+        const lastMessage =
+          result.data.history.messages[result.data.history.messages.length - 1];
+        if (
+          lastMessage &&
+          'uuid' in lastMessage &&
+          'parentUuid' in lastMessage
+        ) {
+          const userPromptText =
+            message !== null && typeof message === 'string'
+              ? message
+              : undefined;
 
-          const maxSnapshots = this.context.config.snapshot?.maxSnapshots || 50;
-          sessionConfigManager.config.fileSnapshots = cleanOldSnapshots(
-            snapshots,
-            maxSnapshots,
+          const snapshot = snapshotCollector.createSnapshot(
+            (lastMessage as NormalizedMessage).uuid,
+            (lastMessage as NormalizedMessage).parentUuid,
+            userPromptText,
           );
-          sessionConfigManager.write();
+
+          if (snapshot) {
+            const snapshots = sessionConfigManager.config.fileSnapshots || [];
+            snapshots.push(snapshot);
+
+            const maxSnapshots =
+              this.context.config.snapshot?.maxSnapshots || 50;
+            sessionConfigManager.config.fileSnapshots = cleanOldSnapshots(
+              snapshots,
+              maxSnapshots,
+            );
+            sessionConfigManager.write();
+          }
         }
+      } catch (error) {
+        // Log error but don't fail the entire conversation
+        console.error('Failed to save snapshot:', error);
       }
     }
 

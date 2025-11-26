@@ -208,6 +208,7 @@ interface AppActions {
   incrementRestoreCounter: () => void;
   showSnapshotModal: () => void;
   hideSnapshotModal: () => void;
+  isRestoringSnapshot: boolean;
   setBashBackgroundPrompt: (prompt: BashPromptBackgroundEvent) => void;
   clearBashBackgroundPrompt: () => void;
   toggleThinking: () => void;
@@ -267,6 +268,7 @@ export const useAppStore = create<AppStore>()(
       thinking: undefined,
 
       snapshotModalVisible: false,
+      isRestoringSnapshot: false,
 
       bashBackgroundPrompt: null,
 
@@ -1004,7 +1006,17 @@ export const useAppStore = create<AppStore>()(
       },
 
       restoreSnapshot: async (targetMessageUuid: string) => {
-        const { bridge, cwd, sessionId } = get();
+        const { bridge, cwd, sessionId, isRestoringSnapshot } = get();
+
+        // Prevent concurrent restore operations
+        if (isRestoringSnapshot) {
+          get().log(
+            '⚠️  A restore operation is already in progress. Please wait.',
+          );
+          return;
+        }
+
+        set({ isRestoringSnapshot: true });
 
         try {
           const restoreResponse = await bridge.request('session.restoreCode', {
@@ -1055,6 +1067,8 @@ export const useAppStore = create<AppStore>()(
         } catch (error: any) {
           get().log(`Error during restore: ${error.message}`);
           return;
+        } finally {
+          set({ isRestoringSnapshot: false });
         }
 
         get().incrementRestoreCounter();
