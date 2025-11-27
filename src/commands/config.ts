@@ -24,6 +24,7 @@ Available Configuration Keys:
   model                                 Primary model for AI interactions (default: flash)
   smallModel                            Smaller model for lightweight operations
   planModel                             Model for planning operations
+  visionModel                           Model for image/vision tasks
   language                              Language for AI responses (default: English)
   quiet                                 Suppress verbose output (boolean, default: false)
   approvalMode                          Approval mode for operations (default|autoEdit|yolo, default: default)
