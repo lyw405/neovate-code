@@ -137,6 +137,7 @@
     "turndown": "^7.2.2",
     "type-fest": "^5.2.0",
     "typescript": "^5.9.3",
+    "undici": "^7.16.0",
     "valtio": "^2.2.0",
     "vitest": "^4.0.10",
     "wrap-ansi": "^9.0.0",

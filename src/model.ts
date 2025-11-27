@@ -70,11 +70,40 @@ export interface Provider {
     baseURL?: string;
     apiKey?: string;
     headers?: Record<string, string>;
+    httpProxy?: string;
   };
 }
 
+import { setupProxyEnv, createProxyFetch } from './utils/proxy';
+
 export type ProvidersMap = Record<string, Provider>;
 export type ModelMap = Record<string, Omit<Model, 'id' | 'cost'>>;
+
+/**
+ * Inject proxy support into AI SDK configuration
+ * Priority: Provider-level proxy > Global proxy
+ *
+ * @param config - SDK configuration object
+ * @param provider - Provider configuration
+ * @returns Config with proxy fetch injected if proxy is configured
+ */
+function withProxyConfig<T extends Record<string, any>>(
+  config: T,
+  provider: Provider,
+): T {
+  const proxyUrl = provider.options?.httpProxy;
+
+  if (proxyUrl) {
+    setupProxyEnv(proxyUrl);
+    const proxyFetch = createProxyFetch();
+    return {
+      ...config,
+      fetch: proxyFetch,
+    };
+  }
+
+  return config;
+}
 
 export const models: ModelMap = {
   'deepseek-v3-0324': {
@@ -958,6 +987,7 @@ function getProviderApiKey(provider: Provider) {
 export const defaultModelCreatorCompatible = (
   name: string,
   provider: Provider,
+  globalConfigDir?: string,
 ): LanguageModelV2 => {
   if (provider.id !== 'openai') {
     assert(provider.api, `Provider ${provider.id} must have an api`);
@@ -965,26 +995,31 @@ export const defaultModelCreatorCompatible = (
   const baseURL = getProviderBaseURL(provider);
   const apiKey = getProviderApiKey(provider);
   assert(baseURL, 'baseURL is required');
-  return createOpenAICompatible({
-    name: provider.id,
-    baseURL,
-    apiKey,
-  })(name);
+  return createOpenAICompatible(
+    withProxyConfig(
+      {
+        name: provider.id,
+        baseURL,
+        apiKey,
+      },
+      provider,
+    ),
+  )(name);
 };
 
 export const defaultModelCreator = (
   name: string,
   provider: Provider,
+  globalConfigDir?: string,
 ): LanguageModelV2 => {
   if (provider.id !== 'openai') {
     assert(provider.api, `Provider ${provider.id} must have an api`);
   }
   const baseURL = getProviderBaseURL(provider);
   const apiKey = getProviderApiKey(provider);
-  return createOpenAI({
-    baseURL,
-    apiKey,
-  }).chat(name);
+  return createOpenAI(withProxyConfig({ baseURL, apiKey }, provider)).chat(
+    name,
+  );
 };
 
 export const providers: ProvidersMap = {
@@ -1028,18 +1063,23 @@ export const providers: ProvidersMap = {
           'Failed to get GitHub Copilot token, use /login to login first',
         );
       }
-      return createOpenAI({
-        baseURL: 'https://api.individual.githubcopilot.com',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'User-Agent': 'GitHubCopilotChat/0.26.7',
-          'Editor-Version': 'vscode/1.99.3',
-          'Editor-Plugin-Version': 'copilot-chat/0.26.7',
-          'Copilot-Integration-Id': 'vscode-chat',
-        },
-        // fix Failed: OpenAI API key is missing
-        apiKey: '',
-      }).chat(name);
+      return createOpenAI(
+        withProxyConfig(
+          {
+            baseURL: 'https://api.individual.githubcopilot.com',
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'User-Agent': 'GitHubCopilotChat/0.26.7',
+              'Editor-Version': 'vscode/1.99.3',
+              'Editor-Plugin-Version': 'copilot-chat/0.26.7',
+              'Copilot-Integration-Id': 'vscode-chat',
+            },
+            // fix Failed: OpenAI API key is missing
+            apiKey: '',
+          },
+          provider,
+        ),
+      ).chat(name);
     },
   },
   openai: {
@@ -1081,10 +1121,9 @@ export const providers: ProvidersMap = {
     createModel(name, provider) {
       const baseURL = getProviderBaseURL(provider);
       const apiKey = getProviderApiKey(provider);
-      const google = createGoogleGenerativeAI({
-        apiKey,
-        baseURL,
-      });
+      const google = createGoogleGenerativeAI(
+        withProxyConfig({ apiKey, baseURL }, provider),
+      );
       return google(name);
     },
   },
@@ -1120,10 +1159,9 @@ export const providers: ProvidersMap = {
     createModel(name, provider) {
       const api = getProviderBaseURL(provider);
       const apiKey = getProviderApiKey(provider);
-      return createXai({
-        baseURL: api,
-        apiKey,
-      }).chat(name);
+      return createXai(
+        withProxyConfig({ baseURL: api, apiKey }, provider),
+      ).chat(name);
     },
   },
   anthropic: {
@@ -1146,10 +1184,9 @@ export const providers: ProvidersMap = {
     createModel(name, provider) {
       const baseURL = getProviderBaseURL(provider);
       const apiKey = getProviderApiKey(provider);
-      return createAnthropic({
-        apiKey,
-        baseURL,
-      }).chat(name);
+      return createAnthropic(
+        withProxyConfig({ apiKey, baseURL }, provider),
+      ).chat(name);
     },
   },
   aihubmix: {
@@ -1184,9 +1221,7 @@ export const providers: ProvidersMap = {
     },
     createModel(name, provider) {
       const apiKey = getProviderApiKey(provider);
-      return createAihubmix({
-        apiKey,
-      }).chat(name);
+      return createAihubmix(withProxyConfig({ apiKey }, provider)).chat(name);
     },
   },
   openrouter: {
@@ -1242,14 +1277,19 @@ export const providers: ProvidersMap = {
     createModel(name, provider) {
       const baseURL = getProviderBaseURL(provider);
       const apiKey = getProviderApiKey(provider);
-      return createOpenRouter({
-        apiKey,
-        baseURL,
-        headers: {
-          'X-Title': 'Neovate Code',
-          'HTTP-Referer': 'https://neovateai.dev/',
-        },
-      }).chat(name);
+      return createOpenRouter(
+        withProxyConfig(
+          {
+            apiKey,
+            baseURL,
+            headers: {
+              'X-Title': 'Neovate Code',
+              'HTTP-Referer': 'https://neovateai.dev/',
+            },
+          },
+          provider,
+        ),
+      ).chat(name);
     },
   },
   iflow: {
@@ -1286,10 +1326,9 @@ export const providers: ProvidersMap = {
     createModel(name, provider) {
       const baseURL = getProviderBaseURL(provider);
       const apiKey = getProviderApiKey(provider);
-      return createOpenAI({
-        baseURL,
-        apiKey,
-      }).chat(name);
+      return createOpenAI(withProxyConfig({ baseURL, apiKey }, provider)).chat(
+        name,
+      );
     },
   },
   'moonshotai-cn': {
@@ -1308,11 +1347,16 @@ export const providers: ProvidersMap = {
     createModel(name, provider) {
       const baseURL = getProviderBaseURL(provider);
       const apiKey = getProviderApiKey(provider);
-      return createOpenAI({
-        baseURL,
-        apiKey,
-        // include usage information in streaming mode why? https://platform.moonshot.cn/docs/guide/migrating-from-openai-to-kimi#stream-模式下的-usage-值
-      }).chat(name);
+      return createOpenAI(
+        withProxyConfig(
+          {
+            baseURL,
+            apiKey,
+            // include usage information in streaming mode why? https://platform.moonshot.cn/docs/guide/migrating-from-openai-to-kimi#stream-模式下的-usage-值
+          },
+          provider,
+        ),
+      ).chat(name);
     },
   },
   groq: {
@@ -1473,10 +1517,9 @@ export const providers: ProvidersMap = {
     createModel(name, provider) {
       const baseURL = getProviderBaseURL(provider);
       const apiKey = getProviderApiKey(provider);
-      return createAnthropic({
-        baseURL,
-        apiKey,
-      }).chat(name);
+      return createAnthropic(
+        withProxyConfig({ baseURL, apiKey }, provider),
+      ).chat(name);
     },
   },
   cerebras: {
@@ -1490,7 +1533,7 @@ export const providers: ProvidersMap = {
     },
     createModel(name, provider) {
       const apiKey = getProviderApiKey(provider);
-      return createCerebras({ apiKey })(name);
+      return createCerebras(withProxyConfig({ apiKey }, provider))(name);
     },
   },
   poe: {
@@ -1576,6 +1619,39 @@ function mergeConfigProviders(
   return mergedProviders;
 }
 
+/**
+ * Apply global proxy to all providers without provider-level proxy
+ *
+ * @param providers - Map of all providers
+ * @param globalHttpProxy - Global proxy URL from config.httpProxy
+ * @returns Updated providers map with global proxy applied
+ */
+function applyGlobalProxyToProviders(
+  providers: ProvidersMap,
+  globalHttpProxy: string,
+): ProvidersMap {
+  return Object.fromEntries(
+    Object.entries(providers).map(([id, prov]) => {
+      const provider = prov as Provider;
+      // Skip if provider already has its own proxy
+      if (provider.options?.httpProxy) {
+        return [id, provider];
+      }
+      // Apply global proxy
+      return [
+        id,
+        {
+          ...provider,
+          options: {
+            ...provider.options,
+            httpProxy: globalHttpProxy,
+          },
+        },
+      ];
+    }),
+  );
+}
+
 export async function resolveModelWithContext(
   name: string | null,
   context: Context,
@@ -1593,9 +1669,19 @@ export async function resolveModelWithContext(
     type: PluginHookType.SeriesLast,
   });
 
-  const finalProviders = context.config.provider
+  // Step 1: Merge config providers if exists
+  let finalProviders = context.config.provider
     ? mergeConfigProviders(hookedProviders, context.config.provider)
     : hookedProviders;
+
+  // Step 2: Apply global proxy to ALL providers that don't have provider-level proxy
+  // This ensures both built-in and custom providers get the global proxy configuration
+  if (context.config.httpProxy) {
+    finalProviders = applyGlobalProxyToProviders(
+      finalProviders,
+      context.config.httpProxy,
+    );
+  }
 
   const hookedModelAlias = await context.apply({
     hook: 'modelAlias',
