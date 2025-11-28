@@ -64,6 +64,7 @@ export type Config = {
   autoUpdate?: boolean;
   browser?: boolean;
   temperature?: number;
+  httpProxy?: string;
 };
 
 const DEFAULT_CONFIG: Partial<Config> = {
@@ -93,6 +94,7 @@ const VALID_CONFIG_KEYS = [
   'provider',
   'browser',
   'temperature',
+  'httpProxy',
 ];
 const ARRAY_CONFIG_KEYS = ['plugins'];
 const OBJECT_CONFIG_KEYS = ['mcpServers', 'commit', 'provider'];
