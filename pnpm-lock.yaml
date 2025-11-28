@@ -68,7 +68,7 @@ importers:
         version: 0.17.2(@swc/core@1.12.1)(@types/node@24.10.1)(@types/react-dom@19.1.9(@types/react@19.2.6))(@types/react@19.2.6)(typescript@5.9.3)
       '@openrouter/ai-sdk-provider':
         specifier: ^1.2.3
-        version: 1.2.3(ai@5.0.97(zod@4.1.12))(react-dom@18.3.1(react@19.2.0))(react@19.2.0)(zod@4.1.12)
+        version: 1.2.3(ai@5.0.97(zod@4.1.12))(react-dom@18.3.1(react@18.3.1))(react@19.2.0)(zod@4.1.12)
       '@sinclair/typebox':
         specifier: ^0.34.38
         version: 0.34.41
@@ -243,6 +243,9 @@ importers:
       typescript:
         specifier: ^5.9.3
         version: 5.9.3
+      undici:
+        specifier: 6.13.0
+        version: 6.13.0
       valtio:
         specifier: ^2.2.0
         version: 2.2.0(@types/react@19.2.6)(react@19.2.0)
@@ -7335,9 +7338,9 @@ packages:
   undici-types@7.16.0:
     resolution: {integrity: sha512-Zz+aZWSj8LE6zoxD+xrjh4VfkIG8Ya6LvYkZqtUQGJPZjYl53ypCaUwWqo7eI0x66KBGeRo+mlBEkMSeSZ38Nw==}
 
-  undici@7.15.0:
-    resolution: {integrity: sha512-7oZJCPvvMvTd0OlqWsIxTuItTpJBpU1tcbVl24FMn3xt3+VSunwUasmfPJRE57oNO1KsZ4PgA1xTdAX4hq8NyQ==}
-    engines: {node: '>=20.18.1'}
+  undici@6.13.0:
+    resolution: {integrity: sha512-Q2rtqmZWrbP8nePMq7mOJIN98M0fYvSgV89vwl/BQRT4mDOeY2GXZngfGpcBBhtky3woM7G24wZV3Q304Bv6cw==}
+    engines: {node: '>=18.0'}
 
   undici@7.16.0:
     resolution: {integrity: sha512-QEg3HPMll0o3t2ourKwOeUAZ159Kn9mx5pnzHRQO8+Wixmh88YdZRiIwat0iNzNNXn0yoEtXJqFpyW7eM8BV7g==}
@@ -9019,9 +9022,9 @@ snapshots:
       '@nodelib/fs.scandir': 2.1.5
       fastq: 1.19.1
 
-  '@openrouter/ai-sdk-provider@1.2.3(ai@5.0.97(zod@4.1.12))(react-dom@18.3.1(react@19.2.0))(react@19.2.0)(zod@4.1.12)':
+  '@openrouter/ai-sdk-provider@1.2.3(ai@5.0.97(zod@4.1.12))(react-dom@18.3.1(react@18.3.1))(react@19.2.0)(zod@4.1.12)':
     dependencies:
-      '@openrouter/sdk': 0.1.11(react-dom@18.3.1(react@19.2.0))(react@19.2.0)
+      '@openrouter/sdk': 0.1.11(react-dom@18.3.1(react@18.3.1))(react@19.2.0)
       ai: 5.0.97(zod@4.1.12)
       zod: 4.1.12
     transitivePeerDependencies:
@@ -9029,7 +9032,7 @@ snapshots:
       - react
       - react-dom
 
-  '@openrouter/sdk@0.1.11(react-dom@18.3.1(react@19.2.0))(react@19.2.0)':
+  '@openrouter/sdk@0.1.11(react-dom@18.3.1(react@18.3.1))(react@19.2.0)':
     dependencies:
       zod: 4.1.12
     optionalDependencies:
@@ -11306,7 +11309,7 @@ snapshots:
       parse5: 7.3.0
       parse5-htmlparser2-tree-adapter: 7.1.0
       parse5-parser-stream: 7.1.2
-      undici: 7.15.0
+      undici: 7.16.0
       whatwg-mimetype: 4.0.0
 
   chevrotain-allstar@0.3.1(chevrotain@11.0.3):
@@ -16030,7 +16033,7 @@ snapshots:
 
   undici-types@7.16.0: {}
 
-  undici@7.15.0: {}
+  undici@6.13.0: {}
 
   undici@7.16.0: {}
 
