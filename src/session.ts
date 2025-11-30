@@ -49,20 +49,27 @@ export type FileOperation = {
   path: string;
   source: 'write' | 'edit' | 'bash';
   /**
-   * Content field semantics depend on the operation type:
-   * - For 'modify': BEFORE content (the state before this modification)
-   * - For 'create': AFTER content (the state after creation)
-   * - For 'delete': The content of the deleted file (for potential restoration)
-   *
-   * IMPORTANT: When used in restore operations from buildRestoreOperations,
-   * 'content' represents the TARGET state we want to restore to.
+   * Content BEFORE this operation was applied
+   * - undefined means file didn't exist before this operation
+   * - string means file existed with this content
    */
-  content?: string;
+  beforeContent?: string;
   /**
-   * AFTER content - only used for 'modify' operations
-   * Represents the state after the modification was applied
+   * Content AFTER this operation was applied
+   * - undefined means file doesn't exist after this operation (was deleted)
+   * - string means file exists with this content
    */
   afterContent?: string;
+  /**
+   * Whether the file existed in the project BEFORE any AI modifications
+   * - true: file was part of the original project
+   * - false: file was created by AI during this session
+   *
+   * This helps distinguish between:
+   * - Modifying an existing project file (wasExisting=true)
+   * - Creating a new file (wasExisting=false)
+   */
+  wasExisting: boolean;
 };
 
 export type FileSnapshot = {

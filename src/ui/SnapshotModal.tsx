@@ -82,35 +82,43 @@ export function SnapshotModal({ onClose }: SnapshotModalProps) {
     }
   };
 
-  const selectItems = snapshots.map((snapshot) => {
-    const fileList = snapshot.affectedFiles.slice(0, 2).join(', ');
-    const moreFiles =
-      snapshot.affectedFiles.length > 2
-        ? ` +${snapshot.affectedFiles.length - 2}`
+  const selectItems = [
+    // Add "Initial State" option at the end (bottom of list)
+    ...snapshots.map((snapshot) => {
+      const fileList = snapshot.affectedFiles.slice(0, 2).join(', ');
+      const moreFiles =
+        snapshot.affectedFiles.length > 2
+          ? ` +${snapshot.affectedFiles.length - 2}`
+          : '';
+
+      // Truncate user prompt to 60 characters
+      const promptPreview = snapshot.userPrompt
+        ? snapshot.userPrompt.length > 60
+          ? `${snapshot.userPrompt.substring(0, 60)}...`
+          : snapshot.userPrompt
         : '';
 
-    // Truncate user prompt to 60 characters
-    const promptPreview = snapshot.userPrompt
-      ? snapshot.userPrompt.length > 60
-        ? `${snapshot.userPrompt.substring(0, 60)}...`
-        : snapshot.userPrompt
-      : '';
+      const label = [
+        formatTime(snapshot.timestamp).padEnd(10),
+        `${snapshot.operationCount} ops`.padEnd(8),
+        `${fileList}${moreFiles}`.padEnd(30),
+      ].join(' ');
 
-    const label = [
-      formatTime(snapshot.timestamp).padEnd(10),
-      `${snapshot.operationCount} ops`.padEnd(8),
-      `${fileList}${moreFiles}`.padEnd(30),
-    ].join(' ');
+      const fullLabel = promptPreview
+        ? `${label}\n    💬 ${promptPreview}`
+        : label;
 
-    const fullLabel = promptPreview
-      ? `${label}\n    💬 ${promptPreview}`
-      : label;
-
-    return {
-      label: fullLabel,
-      value: snapshot.messageUuid,
-    };
-  });
+      return {
+        label: fullLabel,
+        value: snapshot.messageUuid,
+      };
+    }),
+    // Add initial state option
+    {
+      label: `${'Initial'.padEnd(10)} ${'0 ops'.padEnd(8)} (Undo all AI changes)`,
+      value: '__INITIAL_STATE__',
+    },
+  ];
 
   if (loading) {
     return (
@@ -183,9 +191,10 @@ export function SnapshotModal({ onClose }: SnapshotModalProps) {
       width="100%"
     >
       <Box marginBottom={1}>
-        <Text bold>Restore Code Snapshot</Text>
+        <Text bold>Rollback to Previous Step</Text>
         <Text color="gray" dimColor>
-          Restore code and conversation to before selected snapshot
+          Select a step to rollback - undoes changes and fills prompt for
+          re-editing
         </Text>
       </Box>
       {isRestoringSnapshot && (
@@ -193,6 +202,11 @@ export function SnapshotModal({ onClose }: SnapshotModalProps) {
           <Text color="yellow">⏳ Restoring snapshot, please wait...</Text>
         </Box>
       )}
+      <Box marginBottom={1}>
+        <Text color="gray" dimColor>
+          After rollback: undo selected step + later changes, prompt auto-filled
+        </Text>
+      </Box>
       <Box marginBottom={1}>
         <Text color="gray">
           {'  '}
@@ -205,6 +219,69 @@ export function SnapshotModal({ onClose }: SnapshotModalProps) {
           initialIndex={0}
           itemsPerPage={10}
           onSelect={async (item) => {
+            // Handle Initial State rollback
+            if (item.value === '__INITIAL_STATE__') {
+              // Find the first (oldest) snapshot
+              const firstSnapshot = snapshots[snapshots.length - 1];
+
+              if (!firstSnapshot) {
+                log('❌ No snapshots to rollback');
+                onClose();
+                return;
+              }
+
+              // Rollback to the first snapshot (which will undo it)
+              const result = await bridge.request('session.restoreCode', {
+                cwd,
+                sessionId,
+                targetMessageUuid: firstSnapshot.messageUuid,
+              });
+
+              if (result.success) {
+                const data = result.data;
+
+                // Clear input for initial state
+                useAppStore.setState({ inputValue: '' });
+
+                // Reload messages
+                const messagesResponse = await bridge.request(
+                  'session.messages.list',
+                  { cwd, sessionId },
+                );
+                if (messagesResponse.success) {
+                  useAppStore.setState({
+                    messages: messagesResponse.data.messages,
+                  });
+                }
+
+                useAppStore.getState().incrementRestoreCounter();
+
+                const lines: string[] = [];
+                lines.push(
+                  '📍 Rolled back to Initial State (before all AI changes)',
+                );
+
+                if (data.restoredFiles.length > 0) {
+                  lines.push(
+                    `✅ ${data.restoredFiles.length} file(s) restored`,
+                  );
+                }
+
+                if (lines.length > 0) {
+                  log(lines.join('\n'));
+                }
+
+                onClose();
+              } else {
+                log(
+                  `❌ Rollback failed: ${result.error?.message || 'Unknown error'}`,
+                );
+                onClose();
+              }
+              return;
+            }
+
+            // Handle normal snapshot rollback
             const selectedSnapshot = snapshots.find(
               (s) => s.messageUuid === item.value,
             );
@@ -220,7 +297,15 @@ export function SnapshotModal({ onClose }: SnapshotModalProps) {
 
               // Auto-fill prompt to input box if available
               if (data.userPromptToFill) {
-                useAppStore.setState({ inputValue: data.userPromptToFill });
+                useAppStore.setState({
+                  inputValue: data.userPromptToFill,
+                  inputCursorPosition: data.userPromptToFill.length,
+                });
+              } else {
+                useAppStore.setState({
+                  inputValue: '',
+                  inputCursorPosition: 0,
+                });
               }
 
               // Reload messages to show the restore hint message
@@ -242,10 +327,10 @@ export function SnapshotModal({ onClose }: SnapshotModalProps) {
 
               if (selectedSnapshot?.userPrompt) {
                 lines.push(
-                  `📍 Restored to BEFORE: "${selectedSnapshot.userPrompt}"`,
+                  `📍 Rolled back to BEFORE: "${selectedSnapshot.userPrompt}"`,
                 );
                 lines.push(
-                  '💡 Prompt filled in input box - edit and run again',
+                  '💡 Prompt filled in input - edit and Enter to re-run, or Esc to skip',
                 );
               }
 
@@ -278,7 +363,7 @@ export function SnapshotModal({ onClose }: SnapshotModalProps) {
       </Box>
       <Box marginTop={1}>
         <Text color="gray" dimColor>
-          Press ↑↓ to navigate, Enter to restore, Esc to cancel
+          ↑↓: Navigate • Enter: Rollback • Esc: Cancel
         </Text>
       </Box>
     </Box>

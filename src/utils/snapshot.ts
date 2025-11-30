@@ -23,6 +23,7 @@ export class TurnSnapshotCollector {
 
   /**
    * Add a file operation to the collector
+   * If the same file is operated multiple times in one turn, merge the operations
    */
   addOperation(operation: FileOperation): void {
     const absolutePath = path.isAbsolute(operation.path)
@@ -32,11 +33,54 @@ export class TurnSnapshotCollector {
     // Convert to relative path for storage to avoid path issues when cwd changes
     const relativePath = path.relative(this.cwd, absolutePath);
 
-    // Store with relative path to ensure portability
-    this.operations.set(absolutePath, {
-      ...operation,
+    const existing = this.operations.get(absolutePath);
+
+    if (!existing) {
+      // First operation on this file in this turn
+      this.operations.set(absolutePath, {
+        ...operation,
+        path: relativePath,
+      });
+      return;
+    }
+
+    // Merge with existing operation
+    // Key: keep the FIRST beforeContent and the LAST afterContent
+    const merged: FileOperation = {
+      type: operation.type, // Will be recalculated below
       path: relativePath,
-    });
+      source: operation.source,
+      beforeContent: existing.beforeContent, // Keep first before state
+      afterContent: operation.afterContent, // Use last after state
+      wasExisting: existing.wasExisting, // Keep first wasExisting flag
+    };
+
+    // Recalculate type based on before/after state
+    if (
+      merged.beforeContent === undefined &&
+      merged.afterContent === undefined
+    ) {
+      // Created then deleted in same turn - remove operation entirely
+      this.operations.delete(absolutePath);
+      return;
+    } else if (
+      merged.beforeContent === undefined &&
+      merged.afterContent !== undefined
+    ) {
+      // File didn't exist before, exists now = create
+      merged.type = 'create';
+    } else if (
+      merged.beforeContent !== undefined &&
+      merged.afterContent === undefined
+    ) {
+      // File existed before, doesn't exist now = delete
+      merged.type = 'delete';
+    } else {
+      // File existed before and after = modify
+      merged.type = 'modify';
+    }
+
+    this.operations.set(absolutePath, merged);
   }
 
   /**
@@ -86,31 +130,28 @@ export class TurnSnapshotCollector {
       : undefined;
 
     // Determine operation type based on before/after state
-    if (beforeExists && !fileExists) {
-      // File was deleted
-      this.addOperation({
-        type: 'delete',
-        path: filePath,
-        source: toolUse.name as 'write' | 'edit',
-        content: beforeContent,
-      });
+    let operationType: 'create' | 'modify' | 'delete';
+    if (!beforeExists && fileExists) {
+      operationType = 'create';
+    } else if (beforeExists && !fileExists) {
+      operationType = 'delete';
     } else {
-      // File was created or modified
-      this.addOperation({
-        type: beforeExists ? 'modify' : 'create',
-        path: filePath,
-        source: toolUse.name as 'write' | 'edit',
-        // For modify: store BEFORE content in 'content' and AFTER content in 'afterContent'
-        // For create: store AFTER content in 'content'
-        content: beforeExists ? beforeContent : afterContent,
-        afterContent: beforeExists ? afterContent : undefined,
-      });
+      operationType = 'modify';
     }
+
+    this.addOperation({
+      type: operationType,
+      path: filePath,
+      source: toolUse.name as 'write' | 'edit',
+      beforeContent: beforeContent,
+      afterContent: afterContent,
+      wasExisting: beforeExists, // If file existed before, it's an existing project file
+    });
   }
 
   /**
    * Collect snapshot from bash tool
-   * Note: bash only records AFTER state, cannot be fully reverted
+   * Note: bash only records AFTER state, cannot track initial project state
    */
   private async collectFromBashTool(toolResult: {
     _affectedFiles?: string[];
@@ -131,7 +172,9 @@ export class TurnSnapshotCollector {
           type: 'create',
           path: filePath,
           source: 'bash',
-          content,
+          beforeContent: undefined, // bash doesn't know before state
+          afterContent: content,
+          wasExisting: false, // bash-created files are considered new (since we don't know)
         });
       }
     }
@@ -288,42 +331,16 @@ export function restoreFilesFromOperations(
   // Phase 2: Execute operations
   for (const { operation, absolutePath } of operationsToExecute) {
     try {
-      // Apply operation
-      // CRITICAL: Operations from buildRestoreOperations/buildSnapshotPath represent
-      // the CUMULATIVE state we want to restore to.
-      // - For 'create': content = the final state after creation
-      // - For 'modify': afterContent = the final state after all modifications
-      // - For 'delete': delete the file
       switch (operation.type) {
         case 'create':
-          // Create/overwrite file with the create content
-          if (operation.content !== undefined) {
-            const dir = path.dirname(absolutePath);
-            if (!fs.existsSync(dir)) {
-              fs.mkdirSync(dir, { recursive: true });
-            }
-            fs.writeFileSync(absolutePath, operation.content, 'utf-8');
-            result.restoredFiles.push(operation.path);
-          }
-          break;
-
         case 'modify':
-          // For modify: we want the FINAL state which is in afterContent
-          // (The cumulative result of all modifications up to this point)
+          // Restore file to its after state
           if (operation.afterContent !== undefined) {
             const dir = path.dirname(absolutePath);
             if (!fs.existsSync(dir)) {
               fs.mkdirSync(dir, { recursive: true });
             }
             fs.writeFileSync(absolutePath, operation.afterContent, 'utf-8');
-            result.restoredFiles.push(operation.path);
-          } else if (operation.content !== undefined) {
-            // Fallback: if no afterContent, use content
-            const dir = path.dirname(absolutePath);
-            if (!fs.existsSync(dir)) {
-              fs.mkdirSync(dir, { recursive: true });
-            }
-            fs.writeFileSync(absolutePath, operation.content, 'utf-8');
             result.restoredFiles.push(operation.path);
           }
           break;
@@ -347,7 +364,6 @@ export function restoreFilesFromOperations(
       }
     } catch (error) {
       // CRITICAL: If any operation fails, mark as failed and stop immediately
-      // Don't continue with remaining operations to avoid inconsistent state
       result.success = false;
       result.errors.push({
         file: operation.path,
@@ -365,14 +381,16 @@ export function restoreFilesFromOperations(
  * Build restore operations for snapshot rollback
  * Returns operations to restore to the state BEFORE target snapshot
  *
- * CRITICAL: Handles two cases differently:
- * 1. First snapshot (no parent): Revert the snapshot's operations
- * 2. Other snapshots: Restore to parent state + clean up files created after
+ * Strategy:
+ * 1. Build cumulative state from root to target's parent (using buildSnapshotPath)
+ * 2. Handle special case: restoring before first snapshot (project initial state)
+ * 3. Delete files created in target or later snapshots (that aren't in parent state)
+ * 4. Restore project files modified in target or later (that aren't in parent state)
  */
 export function buildRestoreOperations(
   snapshots: FileSnapshot[],
   targetMessageUuid: string,
-  messages?: any[], // Message list to resolve parent relationships
+  messages?: any[],
 ): FileOperation[] {
   const snapshotMap = new Map<string, FileSnapshot>();
   for (const snapshot of snapshots) {
@@ -386,111 +404,214 @@ export function buildRestoreOperations(
 
   const targetTime = new Date(targetSnapshot.timestamp).getTime();
 
-  // Step 1: Build parent state (state before target snapshot)
+  // Step 1: Build parent state (cumulative state before target snapshot)
   const parentOperations = buildSnapshotPath(
     snapshots,
     targetMessageUuid,
     messages,
   );
+
+  // Track which files exist in parent state
   const parentFiles = new Set(parentOperations.map((op) => op.path));
 
-  // CRITICAL: Determine if this is the first snapshot
-  // A snapshot is "first" if:
-  // 1. It has no parent (parentMessageUuid === null), OR
-  // 2. No parent snapshot exists in the chain
-  const isFirstSnapshot = parentOperations.length === 0;
+  // Step 2: Special case - restoring to before first snapshot (project initial state)
+  if (parentOperations.length === 0) {
+    const restoreOps: FileOperation[] = [];
 
-  let restoreOperations: FileOperation[];
+    // Collect original states of all project files that were modified by AI
+    const originalStates = new Map<string, string>();
 
-  if (isFirstSnapshot) {
-    // === CASE 1: First Snapshot ===
-    // Restore to project initial state by REVERTING the snapshot's operations
-    // Example: If snapshot created file.txt, we delete it
-    //          If snapshot modified file.txt from A->B, we restore to A
-    //          If snapshot deleted file.txt, we restore it
-    restoreOperations = [];
-
-    for (const op of targetSnapshot.operations) {
-      if (op.type === 'create') {
-        // Revert create -> delete the file
-        restoreOperations.push({
-          type: 'delete',
-          path: op.path,
-          source: 'write',
-        });
-      } else if (op.type === 'modify') {
-        // Revert modify -> restore to BEFORE content
-        restoreOperations.push({
-          type: 'create', // Use create to restore the before content
-          path: op.path,
-          content: op.content, // This is the BEFORE content
-          source: op.source,
-        });
-      } else if (op.type === 'delete') {
-        // Revert delete -> restore the file
-        if (op.content) {
-          restoreOperations.push({
-            type: 'create',
-            path: op.path,
-            content: op.content, // beforeContent
-            source: op.source,
-          });
+    for (const snapshot of snapshots) {
+      for (const op of snapshot.operations) {
+        // Collect original state of project files (wasExisting=true)
+        // Use the earliest beforeContent as the original state
+        if (
+          op.wasExisting &&
+          op.beforeContent !== undefined &&
+          !originalStates.has(op.path)
+        ) {
+          originalStates.set(op.path, op.beforeContent);
         }
       }
     }
-  } else {
-    // === CASE 2: Non-first Snapshot ===
-    // Restore to parent state + clean up files created after target
-    // Example: Parent has file1.txt, target created file2.txt
-    //          We restore file1.txt to parent state, delete file2.txt
 
-    // Step 2.1: Find all files that were created/modified at or after target time
-    const filesToDelete = new Set<string>();
-    const filesInTargetOrLater = new Set<string>();
+    // Restore all project files to their original states
+    for (const [path, content] of originalStates.entries()) {
+      restoreOps.push({
+        type: 'create',
+        path,
+        beforeContent: undefined,
+        afterContent: content,
+        wasExisting: true,
+        source: 'write',
+      });
+    }
 
+    // Delete all files created by AI (in target or later snapshots)
+    // IMPORTANT: Exclude files that are re-creations of original project files
+    const createdFiles = new Set<string>();
     for (const snapshot of snapshots) {
       const snapshotTime = new Date(snapshot.timestamp).getTime();
-
       if (snapshotTime >= targetTime) {
         for (const op of snapshot.operations) {
-          // Track all files touched in target or later snapshots
-          if (op.type === 'create' || op.type === 'modify') {
-            filesInTargetOrLater.add(op.path);
-
-            // If file doesn't exist in parent state, mark for deletion
-            if (!parentFiles.has(op.path)) {
-              filesToDelete.add(op.path);
+          // File was created (didn't exist before this operation)
+          if (op.beforeContent === undefined && op.afterContent !== undefined) {
+            // Only delete if it's NOT a re-creation of an original project file
+            // If the file exists in originalStates, it means it was an original file
+            // that AI deleted and then re-created with different content
+            // In that case, we should restore it to original state, not delete it
+            if (!originalStates.has(op.path)) {
+              createdFiles.add(op.path);
             }
           }
         }
       }
     }
 
-    // Step 2.2: Combine parent operations + delete operations
-    restoreOperations = [...parentOperations];
+    for (const path of createdFiles) {
+      restoreOps.push({
+        type: 'delete',
+        path,
+        beforeContent: undefined,
+        afterContent: undefined,
+        wasExisting: false,
+        source: 'write',
+      });
+    }
 
-    // Add delete operations for files created after parent
-    for (const filePath of filesToDelete) {
-      restoreOperations.push({
+    return restoreOps;
+  }
+
+  // Step 3: Normal case - restore to parent state
+  const filesToDelete = new Set<string>();
+  const filesToRestore = new Map<string, string>(); // path -> content to restore
+
+  // Track files that were deleted in target or later snapshots
+  // Key: file path, Value: content before deletion (for restoration)
+  const deletedInRange = new Map<string, string>();
+
+  for (const snapshot of snapshots) {
+    const snapshotTime = new Date(snapshot.timestamp).getTime();
+
+    // Only look at target and later snapshots
+    if (snapshotTime >= targetTime) {
+      for (const op of snapshot.operations) {
+        const path = op.path;
+
+        // Track deletions that happen in this range
+        if (op.afterContent === undefined && op.beforeContent !== undefined) {
+          // File was deleted - need to restore it if it's not already tracked
+          if (!deletedInRange.has(path)) {
+            deletedInRange.set(path, op.beforeContent);
+          }
+        }
+
+        // Case 1: File was created (didn't exist before)
+        if (op.beforeContent === undefined && op.afterContent !== undefined) {
+          // Sub-case 1a: File is in parent state but was deleted in range, then recreated
+          // → This is a NEW file created after deletion, should be deleted
+          if (parentFiles.has(path) && deletedInRange.has(path)) {
+            filesToDelete.add(path);
+          }
+          // Sub-case 1b: File is not in parent state at all
+          // → This is a brand new file created after target, should be deleted
+          else if (!parentFiles.has(path)) {
+            filesToDelete.add(path);
+          }
+          // Sub-case 1c: File is in parent state and was NOT deleted in range
+          // → This shouldn't happen (file can't be created if it exists in parent)
+          // → But if it does, keep parent state (do nothing)
+        }
+
+        // Case 2: Project file was modified/deleted but not in parent state
+        // → Need to restore to its original state (earliest beforeContent)
+        if (op.wasExisting && op.beforeContent !== undefined) {
+          if (!parentFiles.has(path) && !filesToRestore.has(path)) {
+            // This file was modified after target but wasn't in parent
+            // Restore it to the state before any AI modifications
+            filesToRestore.set(path, op.beforeContent);
+          }
+        }
+      }
+    }
+  }
+
+  // Step 4: Build final restore operations
+  // Note: We need to deduplicate - a file can only have ONE final operation
+  const finalOperations = new Map<string, FileOperation>();
+
+  // First, add all parent operations
+  for (const op of parentOperations) {
+    finalOperations.set(op.path, op);
+  }
+
+  // Then, handle deletions (files created after parent that need to be removed)
+  for (const filePath of filesToDelete) {
+    // If the file is in parent state, we should NOT delete it!
+    // The delete is for files created AFTER the parent state
+    if (!parentFiles.has(filePath)) {
+      finalOperations.set(filePath, {
         type: 'delete',
         path: filePath,
+        source: 'write',
+        beforeContent: undefined,
+        afterContent: undefined,
+        wasExisting: false,
+      });
+    }
+    // If file is in parent state but was deleted then recreated,
+    // it means we need to remove the recreation and keep the parent state
+    // The parent state operation is already in finalOperations, so we do nothing
+  }
+
+  // Handle files that were deleted in target or later snapshots
+  // These need to be restored to their state before deletion
+  for (const [path, content] of deletedInRange.entries()) {
+    // If file is in parent state, it will be restored via parent operations
+    // If file is NOT in parent state, we need to restore it manually
+    if (!parentFiles.has(path) && !finalOperations.has(path)) {
+      finalOperations.set(path, {
+        type: 'create',
+        path,
+        beforeContent: undefined,
+        afterContent: content,
+        wasExisting: true, // File existed before deletion
         source: 'write',
       });
     }
   }
 
-  return restoreOperations;
+  // Finally, add restore operations for project files
+  // These are files NOT in parent state but need to be restored to original
+  for (const [path, content] of filesToRestore.entries()) {
+    if (!finalOperations.has(path)) {
+      finalOperations.set(path, {
+        type: 'create',
+        path,
+        beforeContent: undefined,
+        afterContent: content,
+        wasExisting: true,
+        source: 'write',
+      });
+    }
+  }
+
+  return Array.from(finalOperations.values());
 }
 
 /**
  * Build snapshot path from message tree
- * Returns operations in order from root to target's PARENT (excluding target)
- * This restores to the state BEFORE the target snapshot was applied
+ * Returns cumulative operations from root to target's PARENT (excluding target)
+ * This represents the state BEFORE the target snapshot was applied
+ *
+ * Operation Merging Rules:
+ * - Multiple operations on same file are merged to show cumulative effect
+ * - Result shows final state after all parent operations
  */
 export function buildSnapshotPath(
   snapshots: FileSnapshot[],
   targetMessageUuid: string,
-  messages?: any[], // Message list to resolve parent relationships
+  messages?: any[],
 ): FileOperation[] {
   const snapshotMap = new Map<string, FileSnapshot>();
   for (const snapshot of snapshots) {
@@ -502,19 +623,17 @@ export function buildSnapshotPath(
     return [];
   }
 
-  // If target itself has no parent, restore to empty state (project initial state)
+  // If target itself has no parent, return empty (project initial state)
   if (targetSnapshot.parentMessageUuid === null) {
     return [];
   }
 
-  // Create messageMap once at the beginning if messages are provided
+  // Create messageMap for parent lookups
   const messageMap = messages
     ? new Map(messages.map((m: any) => [m.uuid, m]))
     : null;
 
   // Find the parent snapshot by walking up the message tree
-  // The parent message might not have a snapshot (e.g., tool messages, user messages)
-  // So we need to find the nearest ancestor message that has a snapshot
   let parentSnapshot: FileSnapshot | undefined;
 
   if (messageMap) {
@@ -527,7 +646,6 @@ export function buildSnapshotPath(
         break;
       }
 
-      // Move to parent message
       const message = messageMap.get(currentMessageUuid);
       if (!message) {
         break;
@@ -538,38 +656,32 @@ export function buildSnapshotPath(
       }
     }
   } else {
-    // Fallback: try direct lookup (old behavior)
     parentSnapshot = snapshots.find(
       (s) => s.messageUuid === targetSnapshot.parentMessageUuid,
     );
   }
 
-  // If no parent snapshot found, it means we're restoring to before the first snapshot
-  // In this case, return empty array to indicate "restore to project initial state"
+  // If no parent snapshot found, return empty (before first snapshot)
   if (!parentSnapshot) {
     return [];
   }
 
-  // Walk backward from parent to root
+  // Walk backward from parent to root to build snapshot chain
   const path: FileSnapshot[] = [];
   let current: FileSnapshot | undefined = parentSnapshot;
-
-  // Reuse messageMap created above
 
   while (current) {
     path.unshift(current);
 
-    // Stop if we reached the root (null parent)
     if (current.parentMessageUuid === null) {
       break;
     }
 
-    // Find next parent snapshot using message tree if available
+    // Find next parent snapshot
     let nextParent: FileSnapshot | undefined;
     if (messageMap) {
       let parentMessageUuid = current.parentMessageUuid;
 
-      // Walk up the message tree to find the next snapshot
       while (parentMessageUuid) {
         const snapshot = snapshotMap.get(parentMessageUuid);
         if (snapshot) {
@@ -592,103 +704,68 @@ export function buildSnapshotPath(
       );
     }
 
-    // Move to next parent
     current = nextParent;
 
-    // If no more parents found, we've reached the oldest snapshot in the chain
     if (!current) {
       break;
     }
   }
 
-  // Merge operations, keeping final state for each file
-  // CRITICAL: Handle all operation combinations correctly
-  // The goal is to build the cumulative state from root to parent
-  const finalOperations = new Map<string, FileOperation>();
+  // Merge operations: track cumulative state for each file
+  // Key insight: we need final afterContent for each file after all operations
+  const finalState = new Map<string, FileOperation>();
 
   for (const snapshot of path) {
     for (const operation of snapshot.operations) {
       const key = operation.path;
+      const existing = finalState.get(key);
 
-      const existing = finalOperations.get(key);
-      if (existing) {
-        // Handle operation merging based on type combinations
-
-        if (existing.type === 'create' && operation.type === 'delete') {
-          // create + delete = file doesn't exist
-          finalOperations.delete(key);
-          continue;
-        }
-
-        if (existing.type === 'modify' && operation.type === 'delete') {
-          // modify + delete = file doesn't exist
-          finalOperations.delete(key);
-          continue;
-        }
-
-        if (existing.type === 'create' && operation.type === 'modify') {
-          // create + modify = create with the FINAL afterContent
-          // The file was created (existing.content = AFTER state of creation)
-          // Then modified (operation.afterContent = final state)
-          finalOperations.set(key, {
-            type: 'create',
-            path: operation.path,
-            content: operation.afterContent, // Use the final modified state
-            source: operation.source,
-          });
-          continue;
-        }
-
-        if (existing.type === 'modify' && operation.type === 'modify') {
-          // modify + modify = modify with FIRST before and LAST after
-          // First modify: A -> B (content=A, afterContent=B)
-          // Second modify: B -> C (content=B, afterContent=C)
-          // Result: A -> C (content=A, afterContent=C)
-          finalOperations.set(key, {
-            type: 'modify',
-            path: operation.path,
-            content: existing.content, // Keep the FIRST before content (original state)
-            afterContent: operation.afterContent, // Use the LAST after content (final state)
-            source: operation.source,
-          });
-          continue;
-        }
-
-        if (existing.type === 'delete' && operation.type === 'create') {
-          // delete + create = file exists with new content
-          // Treat as a create operation with the new content
-          finalOperations.set(key, {
-            type: 'create',
-            path: operation.path,
-            content: operation.content, // The new content
-            source: operation.source,
-          });
-          continue;
-        }
-
-        if (existing.type === 'delete' && operation.type === 'modify') {
-          // delete + modify = file exists with modified content
-          // This is unusual but possible if file was deleted then recreated and modified
-          // Treat as create with the final afterContent
-          finalOperations.set(key, {
-            type: 'create',
-            path: operation.path,
-            content: operation.afterContent, // The final modified content
-            source: operation.source,
-          });
-          continue;
-        }
-
-        // For other combinations, keep the latest operation
-        // This handles: create+create (impossible), modify+create (unusual), etc.
+      if (!existing) {
+        // First operation on this file - keep it as is
+        finalState.set(key, operation);
+        continue;
       }
 
-      // Keep latest operation (or first operation if no existing)
-      finalOperations.set(key, operation);
+      // Merge with existing operation
+      // Track: original beforeContent + final afterContent
+      const merged: FileOperation = {
+        type: operation.type,
+        path: operation.path,
+        source: operation.source,
+        beforeContent: existing.beforeContent, // Keep original before state
+        afterContent: operation.afterContent, // Use latest after state
+        wasExisting: existing.wasExisting, // Keep original wasExisting flag
+      };
+
+      // Handle special cases
+      if (
+        existing.afterContent === undefined &&
+        operation.beforeContent === undefined &&
+        operation.afterContent !== undefined
+      ) {
+        // File was deleted then recreated - treat as create with new content
+        // Use the new operation's wasExisting flag (if it's a recreation of original file)
+        merged.type = 'create';
+        merged.beforeContent = undefined;
+        merged.wasExisting = operation.wasExisting; // Preserve the recreation's wasExisting flag
+      } else if (operation.afterContent === undefined) {
+        // File was deleted - remove from final state
+        finalState.delete(key);
+        continue;
+      } else if (
+        existing.beforeContent === undefined &&
+        operation.beforeContent !== undefined
+      ) {
+        // File was created then modified - keep as create with final content
+        merged.type = 'create';
+        merged.beforeContent = undefined;
+      }
+
+      finalState.set(key, merged);
     }
   }
 
-  return Array.from(finalOperations.values());
+  return Array.from(finalState.values());
 }
 
 /**
