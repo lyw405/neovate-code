@@ -378,116 +378,123 @@ export function restoreFilesFromOperations(
 }
 
 /**
- * Build restore operations for snapshot rollback
- * Returns operations to restore to the state BEFORE target snapshot
- *
- * Strategy:
- * 1. Build cumulative state from root to target's parent (using buildSnapshotPath)
- * 2. Handle special case: restoring before first snapshot (project initial state)
- * 3. Delete files created in target or later snapshots (that aren't in parent state)
- * 4. Restore project files modified in target or later (that aren't in parent state)
+ * Collect original states of all project files that were modified by AI
+ * Returns a map of file path to original content (earliest beforeContent)
  */
-export function buildRestoreOperations(
-  snapshots: FileSnapshot[],
-  targetMessageUuid: string,
-  messages?: any[],
-): FileOperation[] {
-  const snapshotMap = new Map<string, FileSnapshot>();
+function collectOriginalStates(snapshots: FileSnapshot[]): Map<string, string> {
+  const originalStates = new Map<string, string>();
+
   for (const snapshot of snapshots) {
-    snapshotMap.set(snapshot.messageUuid, snapshot);
-  }
-
-  const targetSnapshot = snapshotMap.get(targetMessageUuid);
-  if (!targetSnapshot) {
-    return [];
-  }
-
-  const targetTime = new Date(targetSnapshot.timestamp).getTime();
-
-  // Step 1: Build parent state (cumulative state before target snapshot)
-  const parentOperations = buildSnapshotPath(
-    snapshots,
-    targetMessageUuid,
-    messages,
-  );
-
-  // Track which files exist in parent state
-  const parentFiles = new Set(parentOperations.map((op) => op.path));
-
-  // Step 2: Special case - restoring to before first snapshot (project initial state)
-  if (parentOperations.length === 0) {
-    const restoreOps: FileOperation[] = [];
-
-    // Collect original states of all project files that were modified by AI
-    const originalStates = new Map<string, string>();
-
-    for (const snapshot of snapshots) {
-      for (const op of snapshot.operations) {
-        // Collect original state of project files (wasExisting=true)
-        // Use the earliest beforeContent as the original state
-        if (
-          op.wasExisting &&
-          op.beforeContent !== undefined &&
-          !originalStates.has(op.path)
-        ) {
-          originalStates.set(op.path, op.beforeContent);
-        }
+    for (const op of snapshot.operations) {
+      // Collect original state of project files (wasExisting=true)
+      // Use the earliest beforeContent as the original state
+      if (
+        op.wasExisting &&
+        op.beforeContent !== undefined &&
+        !originalStates.has(op.path)
+      ) {
+        originalStates.set(op.path, op.beforeContent);
       }
     }
+  }
 
-    // Restore all project files to their original states
-    for (const [path, content] of originalStates.entries()) {
-      restoreOps.push({
-        type: 'create',
-        path,
-        beforeContent: undefined,
-        afterContent: content,
-        wasExisting: true,
-        source: 'write',
-      });
-    }
+  return originalStates;
+}
 
-    // Delete all files created by AI (in target or later snapshots)
-    // IMPORTANT: Exclude files that are re-creations of original project files
-    const createdFiles = new Set<string>();
-    for (const snapshot of snapshots) {
-      const snapshotTime = new Date(snapshot.timestamp).getTime();
-      if (snapshotTime >= targetTime) {
-        for (const op of snapshot.operations) {
-          // File was created (didn't exist before this operation)
-          if (op.beforeContent === undefined && op.afterContent !== undefined) {
-            // Only delete if it's NOT a re-creation of an original project file
-            // If the file exists in originalStates, it means it was an original file
-            // that AI deleted and then re-created with different content
-            // In that case, we should restore it to original state, not delete it
-            if (!originalStates.has(op.path)) {
-              createdFiles.add(op.path);
-            }
+/**
+ * Collect files created by AI in or after target snapshot
+ * Excludes re-creations of original project files
+ */
+function collectCreatedFiles(
+  snapshots: FileSnapshot[],
+  targetTime: number,
+  originalStates: Map<string, string>,
+): Set<string> {
+  const createdFiles = new Set<string>();
+
+  for (const snapshot of snapshots) {
+    const snapshotTime = new Date(snapshot.timestamp).getTime();
+    if (snapshotTime >= targetTime) {
+      for (const op of snapshot.operations) {
+        // File was created (didn't exist before this operation)
+        if (op.beforeContent === undefined && op.afterContent !== undefined) {
+          // Only delete if it's NOT a re-creation of an original project file
+          // If the file exists in originalStates, it means it was an original file
+          // that AI deleted and then re-created with different content
+          // In that case, we should restore it to original state, not delete it
+          if (!originalStates.has(op.path)) {
+            createdFiles.add(op.path);
           }
         }
       }
     }
-
-    for (const path of createdFiles) {
-      restoreOps.push({
-        type: 'delete',
-        path,
-        beforeContent: undefined,
-        afterContent: undefined,
-        wasExisting: false,
-        source: 'write',
-      });
-    }
-
-    return restoreOps;
   }
 
-  // Step 3: Normal case - restore to parent state
-  const filesToDelete = new Set<string>();
-  const filesToRestore = new Map<string, string>(); // path -> content to restore
+  return createdFiles;
+}
 
-  // Track files that were deleted in target or later snapshots
-  // Key: file path, Value: content before deletion (for restoration)
+/**
+ * Build restore operations for initial state (before first snapshot)
+ * Restores all project files to original state and deletes AI-created files
+ */
+function buildInitialStateRestoreOperations(
+  snapshots: FileSnapshot[],
+  targetTime: number,
+): FileOperation[] {
+  const restoreOps: FileOperation[] = [];
+
+  // Collect original states of all project files that were modified by AI
+  const originalStates = collectOriginalStates(snapshots);
+
+  // Restore all project files to their original states
+  for (const [path, content] of originalStates.entries()) {
+    restoreOps.push({
+      type: 'create',
+      path,
+      beforeContent: undefined,
+      afterContent: content,
+      wasExisting: true,
+      source: 'write',
+    });
+  }
+
+  // Delete all files created by AI (in target or later snapshots)
+  // IMPORTANT: Exclude files that are re-creations of original project files
+  const createdFiles = collectCreatedFiles(
+    snapshots,
+    targetTime,
+    originalStates,
+  );
+
+  for (const path of createdFiles) {
+    restoreOps.push({
+      type: 'delete',
+      path,
+      beforeContent: undefined,
+      afterContent: undefined,
+      wasExisting: false,
+      source: 'write',
+    });
+  }
+
+  return restoreOps;
+}
+
+/**
+ * Analyze operations in target and later snapshots
+ * Returns tracking data for deletions, files to delete, and files to restore
+ */
+function analyzeOperationsInRange(
+  snapshots: FileSnapshot[],
+  targetTime: number,
+  parentFiles: Set<string>,
+): {
+  deletedInRange: Map<string, string>;
+  filesToDelete: Set<string>;
+  filesToRestore: Map<string, string>;
+} {
+  const filesToDelete = new Set<string>();
+  const filesToRestore = new Map<string, string>();
   const deletedInRange = new Map<string, string>();
 
   for (const snapshot of snapshots) {
@@ -536,8 +543,19 @@ export function buildRestoreOperations(
     }
   }
 
-  // Step 4: Build final restore operations
-  // Note: We need to deduplicate - a file can only have ONE final operation
+  return { deletedInRange, filesToDelete, filesToRestore };
+}
+
+/**
+ * Build final restore operations map by merging parent operations with cleanup operations
+ */
+function buildFinalOperationsMap(
+  parentOperations: FileOperation[],
+  parentFiles: Set<string>,
+  filesToDelete: Set<string>,
+  deletedInRange: Map<string, string>,
+  filesToRestore: Map<string, string>,
+): Map<string, FileOperation> {
   const finalOperations = new Map<string, FileOperation>();
 
   // First, add all parent operations
@@ -595,6 +613,65 @@ export function buildRestoreOperations(
       });
     }
   }
+
+  return finalOperations;
+}
+
+/**
+ * Build restore operations for snapshot rollback
+ * Returns operations to restore to the state BEFORE target snapshot
+ *
+ * Strategy:
+ * 1. Build cumulative state from root to target's parent (using buildSnapshotPath)
+ * 2. Handle special case: restoring before first snapshot (project initial state)
+ * 3. Delete files created in target or later snapshots (that aren't in parent state)
+ * 4. Restore project files modified in target or later (that aren't in parent state)
+ */
+export function buildRestoreOperations(
+  snapshots: FileSnapshot[],
+  targetMessageUuid: string,
+  messages?: any[],
+): FileOperation[] {
+  const snapshotMap = new Map<string, FileSnapshot>();
+  for (const snapshot of snapshots) {
+    snapshotMap.set(snapshot.messageUuid, snapshot);
+  }
+
+  const targetSnapshot = snapshotMap.get(targetMessageUuid);
+  if (!targetSnapshot) {
+    return [];
+  }
+
+  const targetTime = new Date(targetSnapshot.timestamp).getTime();
+
+  // Step 1: Build parent state (cumulative state before target snapshot)
+  const parentOperations = buildSnapshotPath(
+    snapshots,
+    targetMessageUuid,
+    messages,
+  );
+
+  // Step 2: Special case - restoring to before first snapshot (project initial state)
+  if (parentOperations.length === 0) {
+    return buildInitialStateRestoreOperations(snapshots, targetTime);
+  }
+
+  // Step 3: Normal case - restore to parent state
+  // Track which files exist in parent state
+  const parentFiles = new Set(parentOperations.map((op) => op.path));
+
+  // Analyze operations in target and later snapshots
+  const { deletedInRange, filesToDelete, filesToRestore } =
+    analyzeOperationsInRange(snapshots, targetTime, parentFiles);
+
+  // Step 4: Build final restore operations
+  const finalOperations = buildFinalOperationsMap(
+    parentOperations,
+    parentFiles,
+    filesToDelete,
+    deletedInRange,
+    filesToRestore,
+  );
 
   return Array.from(finalOperations.values());
 }
