@@ -244,6 +244,7 @@ export class McpOAuthProvider {
 
     const headers: HeadersInit = {
       'Content-Type': 'application/x-www-form-urlencoded',
+      Accept: 'application/json', // GitHub requires this for JSON response
     };
 
     // Add client authentication if secret is available
@@ -266,7 +267,26 @@ export class McpOAuthProvider {
         throw new Error(`Token exchange failed: ${error}`);
       }
 
-      const data = await response.json();
+      // Parse response based on content type
+      const contentType = response.headers.get('content-type') || '';
+      let data: any;
+
+      if (contentType.includes('application/json')) {
+        data = await response.json();
+      } else {
+        // Parse URL-encoded response (e.g., GitHub's default format)
+        const text = await response.text();
+        const params = new URLSearchParams(text);
+        data = {
+          access_token: params.get('access_token'),
+          token_type: params.get('token_type'),
+          scope: params.get('scope'),
+          refresh_token: params.get('refresh_token'),
+          expires_in: params.get('expires_in')
+            ? Number(params.get('expires_in'))
+            : undefined,
+        };
+      }
 
       const token: McpTokenInfo = {
         accessToken: data.access_token,
@@ -317,6 +337,7 @@ export class McpOAuthProvider {
 
     const headers: HeadersInit = {
       'Content-Type': 'application/x-www-form-urlencoded',
+      Accept: 'application/json', // GitHub requires this for JSON response
     };
 
     if (clientSecret) {
@@ -337,7 +358,26 @@ export class McpOAuthProvider {
       throw new Error(`Token refresh failed: ${error}`);
     }
 
-    const data = await response.json();
+    // Parse response based on content type
+    const contentType = response.headers.get('content-type') || '';
+    let data: any;
+
+    if (contentType.includes('application/json')) {
+      data = await response.json();
+    } else {
+      // Parse URL-encoded response (e.g., GitHub's default format)
+      const text = await response.text();
+      const params = new URLSearchParams(text);
+      data = {
+        access_token: params.get('access_token'),
+        token_type: params.get('token_type'),
+        scope: params.get('scope'),
+        refresh_token: params.get('refresh_token'),
+        expires_in: params.get('expires_in')
+          ? Number(params.get('expires_in'))
+          : undefined,
+      };
+    }
 
     return {
       accessToken: data.access_token,
