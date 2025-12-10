@@ -14,7 +14,7 @@ export interface OAuthCallbackData {
  */
 export class McpOAuthCallbackServer {
   private static readonly PORT = 19876;
-  private static readonly HOST = 'localhost';
+  private static readonly HOST = '127.0.0.1'; // More secure than 'localhost'
 
   private server: http.Server | null = null;
   private pendingCallbacks: Map<
