@@ -17,7 +17,14 @@ interface McpServerConfig {
 interface McpServerStatus {
   name: string;
   config: McpServerConfig;
-  status: 'pending' | 'connecting' | 'connected' | 'failed' | 'disconnected';
+  status:
+    | 'pending'
+    | 'connecting'
+    | 'connected'
+    | 'failed'
+    | 'disconnected'
+    | 'needs_auth'
+    | 'needs_client_registration';
   error?: string;
   toolCount: number;
   tools: string[];
@@ -166,6 +173,10 @@ const McpManagerComponent: React.FC<McpManagerProps> = ({ onExit }) => {
         return pc.red('✗');
       case 'disconnected':
         return pc.red('○');
+      case 'needs_auth':
+        return pc.yellow('🔐');
+      case 'needs_client_registration':
+        return pc.red('🔑');
       default:
         return pc.gray('?');
     }
@@ -210,6 +221,24 @@ const McpManagerComponent: React.FC<McpManagerProps> = ({ onExit }) => {
         return (
           <Text color="red">
             disconnected · <Text color="cyan">Enter</Text> to reconnect
+          </Text>
+        );
+      case 'needs_auth':
+        return (
+          <Text color="yellow">
+            needs authentication · run:{' '}
+            <Text color="cyan">
+              {productName.toLowerCase()} mcp auth {server.name}
+            </Text>
+          </Text>
+        );
+      case 'needs_client_registration':
+        return (
+          <Text color="red">
+            OAuth client registration required · run:{' '}
+            <Text color="cyan">
+              {productName.toLowerCase()} mcp auth {server.name}
+            </Text>
           </Text>
         );
       default:

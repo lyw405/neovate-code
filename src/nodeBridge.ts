@@ -339,7 +339,9 @@ class NodeHandlerRegistry {
             | 'connecting'
             | 'connected'
             | 'failed'
-            | 'disconnected';
+            | 'disconnected'
+            | 'needs_auth'
+            | 'needs_client_registration';
           config: McpServerConfig;
           error?: string;
           toolCount?: number;

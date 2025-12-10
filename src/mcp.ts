@@ -3,6 +3,8 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import createDebug from 'debug';
 import { existsSync, readFileSync } from 'fs';
 import { resolve } from 'pathe';
+import { McpAuth } from './mcp/auth';
+import { McpOAuthProvider } from './mcp/oauth-provider';
 import type { ImagePart, TextPart } from './message';
 import type { Tool } from './tool';
 import { safeStringify } from './utils/safeStringify';
@@ -19,6 +21,25 @@ export interface MCPConfig {
    */
   timeout?: number;
   headers?: Record<string, string>;
+  /**
+   * OAuth configuration for remote servers
+   * - Set to false to disable OAuth for this server
+   * - Set to true or {} to enable auto-detection
+   * - Set to object with clientId/clientSecret for pre-registered clients
+   */
+  oauth?: boolean | McpOAuthConfig;
+}
+
+/**
+ * OAuth configuration for MCP servers
+ */
+export interface McpOAuthConfig {
+  clientId?: string;
+  clientSecret?: string;
+  scope?: string;
+  authorizationEndpoint?: string;
+  tokenEndpoint?: string;
+  registrationEndpoint?: string;
 }
 
 const debug = createDebug('neovate:mcp');
@@ -28,7 +49,9 @@ type MCPServerStatus =
   | 'connecting'
   | 'connected'
   | 'failed'
-  | 'disconnected';
+  | 'disconnected'
+  | 'needs_auth'
+  | 'needs_client_registration';
 
 interface ServerState {
   config: MCPConfig;
@@ -38,6 +61,7 @@ interface ServerState {
   client?: any; // Store client for cleanup
   retryCount: number;
   isTemporaryError?: boolean;
+  oauthProvider?: McpOAuthProvider; // OAuth provider for this server
 }
 
 export class MCPManager {
@@ -46,10 +70,12 @@ export class MCPManager {
   private isInitialized: boolean = false;
   private initPromise?: Promise<void>;
   private initLock: boolean = false;
+  private auth: McpAuth = new McpAuth();
 
   static create(mcpServers: Record<string, MCPConfig>): MCPManager {
     debug('create MCPManager', mcpServers);
     const manager = new MCPManager();
+    manager.auth = new McpAuth();
     manager.configs = mcpServers || {};
 
     // Initialize servers state without connecting
@@ -63,6 +89,11 @@ export class MCPManager {
         status: 'pending',
         retryCount: 0,
       });
+
+      // Create OAuth provider for remote servers if OAuth is enabled
+      if (config.url && manager._shouldUseOAuth(config)) {
+        manager._createOAuthProvider(key, config);
+      }
     }
 
     return manager;
@@ -126,7 +157,10 @@ export class MCPManager {
       serverState.status = 'connecting';
 
       // Test connection and fetch tools
-      const { client, tools } = await this._testConnectionAndFetchTools(config);
+      const { client, tools } = await this._testConnectionAndFetchTools(
+        key,
+        config,
+      );
 
       serverState.status = 'connected';
       serverState.client = client;
@@ -134,12 +168,32 @@ export class MCPManager {
       serverState.error = undefined;
 
       debug(
-        `MCP server connected successfully: ${key}, tools: ${Object.keys(tools).length}`,
+        `MCP server connected successfully: ${key}, tools: ${
+          Object.keys(tools).length
+        }`,
       );
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
       debug(`Failed to connect MCP server ${key}: ${errorMessage}`);
+
+      // Check if this is an authentication error (401)
+      if (this._isUnauthorizedError(error) && serverState.oauthProvider) {
+        debug(`Detected 401 error, marking server as needs_auth: ${key}`);
+        serverState.status = 'needs_auth';
+        serverState.error = 'Authentication required';
+        serverState.retryCount += 1;
+        return;
+      }
+
+      // Check if this is a client registration error
+      if (this._isClientRegistrationError(error) && serverState.oauthProvider) {
+        debug(`Detected client registration error: ${key}`);
+        serverState.status = 'needs_client_registration';
+        serverState.error = 'OAuth client registration required';
+        serverState.retryCount += 1;
+        return;
+      }
 
       // Classify error types for better handling
       const isTemporaryError = this._isTemporaryError(error);
@@ -324,7 +378,7 @@ export class MCPManager {
     debug(`Successfully reconnected MCP server: ${serverName}`);
   }
 
-  private async _createClient(config: MCPConfig) {
+  private async _createClient(serverName: string, config: MCPConfig) {
     if (config.command) {
       // Stdio transport (for local servers only)
       const env = config.env
@@ -344,6 +398,18 @@ export class MCPManager {
         }),
       });
     } else if (config.url) {
+      // Get OAuth token if available
+      const serverState = this.servers.get(serverName);
+      const headers = { ...config.headers };
+
+      if (serverState?.oauthProvider) {
+        const token = await serverState.oauthProvider.getAccessToken();
+        if (token) {
+          headers.Authorization = `Bearer ${token}`;
+          debug(`Added OAuth token to headers for ${serverName}`);
+        }
+      }
+
       // HTTP or SSE transport
       const transportType = config.type || 'http'; // Default to HTTP
       if (transportType === 'sse') {
@@ -352,7 +418,7 @@ export class MCPManager {
           transport: {
             type: 'sse',
             url: config.url,
-            headers: config.headers,
+            headers,
           },
         });
       } else {
@@ -360,7 +426,7 @@ export class MCPManager {
         return experimental_createMCPClient({
           transport: new StreamableHTTPClientTransport(new URL(config.url), {
             requestInit: {
-              headers: config.headers,
+              headers,
             },
           }),
         });
@@ -371,9 +437,10 @@ export class MCPManager {
   }
 
   private async _testConnectionAndFetchTools(
+    serverName: string,
     config: MCPConfig,
   ): Promise<{ client: any; tools: Record<string, any> }> {
-    const client = await this._createClient(config);
+    const client = await this._createClient(serverName, config);
     try {
       const tools = await client.tools();
       return { client, tools };
@@ -436,6 +503,41 @@ export class MCPManager {
     return true;
   }
 
+  /**
+   * Check if error is 401 Unauthorized
+   */
+  private _isUnauthorizedError(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+      return false;
+    }
+
+    const message = error.message.toLowerCase();
+
+    return (
+      message.includes('401') ||
+      message.includes('unauthorized') ||
+      message.includes('authentication required') ||
+      message.includes('not authenticated')
+    );
+  }
+
+  /**
+   * Check if error is related to client registration
+   */
+  private _isClientRegistrationError(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+      return false;
+    }
+
+    const message = error.message.toLowerCase();
+
+    return (
+      message.includes('client registration') ||
+      message.includes('invalid_client') ||
+      message.includes('client not found')
+    );
+  }
+
   #convertAiSdkToolToLocal(
     toolName: string,
     toolDef: any,
@@ -454,7 +556,9 @@ export class MCPManager {
           // toolDef is already a Tool from AI SDK with an execute method
           const result = await toolDef.execute(params || {});
 
-          const returnDisplay = `Tool ${toolName} executed successfully${params ? `, parameters: ${JSON.stringify(params)}` : ''}`;
+          const returnDisplay = `Tool ${toolName} executed successfully${
+            params ? `, parameters: ${JSON.stringify(params)}` : ''
+          }`;
           const llmContent = convertMcpResultToLlmContent(result);
 
           return {
@@ -472,6 +576,115 @@ export class MCPManager {
         category: 'network',
       },
     };
+  }
+
+  /**
+   * Check if OAuth should be used for this config
+   */
+  private _shouldUseOAuth(config: MCPConfig): boolean {
+    // OAuth disabled explicitly
+    if (config.oauth === false) {
+      return false;
+    }
+
+    // OAuth enabled explicitly or by default for remote servers
+    return true;
+  }
+
+  /**
+   * Create OAuth provider for a server
+   */
+  private _createOAuthProvider(serverName: string, config: MCPConfig): void {
+    if (!config.url) return;
+
+    const serverState = this.servers.get(serverName);
+    if (!serverState) return;
+
+    const oauthConfig: McpOAuthConfig =
+      typeof config.oauth === 'object' ? config.oauth : {};
+
+    serverState.oauthProvider = new McpOAuthProvider(
+      serverName,
+      config.url,
+      oauthConfig,
+      this.auth,
+    );
+
+    debug(`OAuth provider created for ${serverName}`);
+  }
+
+  /**
+   * Get OAuth provider for a server
+   */
+  getOAuthProvider(serverName: string): McpOAuthProvider | undefined {
+    return this.servers.get(serverName)?.oauthProvider;
+  }
+
+  /**
+   * Get auth instance
+   */
+  getAuth(): McpAuth {
+    return this.auth;
+  }
+
+  /**
+   * Start OAuth authentication flow for a server
+   */
+  async startOAuthFlow(serverName: string): Promise<void> {
+    const serverState = this.servers.get(serverName);
+    if (!serverState) {
+      throw new Error(`Server ${serverName} not found`);
+    }
+
+    if (!serverState.oauthProvider) {
+      throw new Error(`Server ${serverName} does not support OAuth`);
+    }
+
+    const { getGlobalCallbackServer } = await import('./mcp/oauth-callback');
+    const callbackServer = getGlobalCallbackServer();
+
+    // Start callback server if not running
+    if (!callbackServer.isRunning()) {
+      await callbackServer.start();
+      debug('OAuth callback server started');
+    }
+
+    // Generate PKCE values
+    const state = McpOAuthProvider.generateState();
+    const codeVerifier = McpOAuthProvider.generateCodeVerifier();
+
+    // Get authorization URL
+    const authUrl = await serverState.oauthProvider.getAuthorizationUrl(
+      state,
+      codeVerifier,
+    );
+
+    debug(`Authorization URL generated for ${serverName}: ${authUrl}`);
+
+    // Register callback
+    const callbackPromise = callbackServer.registerCallback(
+      state,
+      serverState.oauthProvider,
+      codeVerifier,
+    );
+
+    // Open browser
+    const open = (await import('open')).default;
+    await open(authUrl);
+
+    debug('Browser opened for authentication');
+
+    // Wait for callback
+    try {
+      await callbackPromise;
+      debug(`OAuth flow completed successfully for ${serverName}`);
+
+      // Retry connection
+      await this.retryConnection(serverName);
+    } catch (error) {
+      debug(`OAuth flow failed for ${serverName}:`, error);
+      throw error;
+    }
   }
 }
 
@@ -496,7 +709,9 @@ export function parseMcpConfig(
         configData = JSON.parse(fileContent);
       } catch (error) {
         throw new Error(
-          `Failed to parse MCP config file ${configPath}: ${error instanceof Error ? error.message : String(error)}`,
+          `Failed to parse MCP config file ${configPath}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
         );
       }
     }

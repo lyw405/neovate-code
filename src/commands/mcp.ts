@@ -28,6 +28,8 @@ Commands:
   list|ls [options]                     List all MCP servers
   enable [options] <name>               Enable an MCP server
   disable [options] <name>              Disable an MCP server
+  auth <name>                           Authenticate with OAuth-enabled MCP server
+  logout <name>                         Remove OAuth credentials for MCP server
   help                                  Show help
 
 Examples:
@@ -43,6 +45,8 @@ Examples:
   ${p} mcp rm -g my-server            Remove my-server from global config
   ${p} mcp enable my-server           Enable my-server in project config
   ${p} mcp disable -g my-server       Disable my-server in global config
+  ${p} mcp auth my-server             Start OAuth authentication for my-server
+  ${p} mcp logout my-server           Remove OAuth credentials for my-server
       `.trim(),
   );
 }
@@ -244,5 +248,50 @@ export async function runMCP(context: Context) {
       JSON.stringify(mcpServers),
     );
     console.log(`Disabled ${key} in ${configPath}`);
+  }
+
+  // auth
+  if (command === 'auth') {
+    const serverName = argv._[1] as string;
+    if (!serverName) {
+      console.error('Missing server name');
+      console.log(`Usage: ${productName.toLowerCase()} mcp auth <name>`);
+      return;
+    }
+
+    console.log(`Starting OAuth authentication for ${serverName}...`);
+
+    try {
+      const mcpManager = context.mcpManager;
+      await mcpManager.startOAuthFlow(serverName);
+      console.log(`✓ Authentication successful for ${serverName}`);
+    } catch (error) {
+      console.error(
+        `Authentication failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      process.exit(1);
+    }
+  }
+
+  // logout
+  if (command === 'logout') {
+    const serverName = argv._[1] as string;
+    if (!serverName) {
+      console.error('Missing server name');
+      console.log(`Usage: ${productName.toLowerCase()} mcp logout <name>`);
+      return;
+    }
+
+    try {
+      const mcpManager = context.mcpManager;
+      const auth = mcpManager.getAuth();
+      auth.removeCredentials(serverName);
+      console.log(`✓ Removed OAuth credentials for ${serverName}`);
+    } catch (error) {
+      console.error(
+        `Failed to remove credentials: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      process.exit(1);
+    }
   }
 }
