@@ -285,6 +285,34 @@ export async function runMCP(context: Context) {
     try {
       const mcpManager = context.mcpManager;
       const auth = mcpManager.getAuth();
+      const oauthProvider = mcpManager.getOAuthProvider(serverName);
+      const token = auth.getToken(serverName);
+
+      // 1. Revoke token on OAuth server (RFC 7009)
+      if (token?.accessToken && oauthProvider) {
+        try {
+          console.log(`Revoking access token on server...`);
+          await oauthProvider.revokeToken(token.accessToken, 'access_token');
+
+          // Also revoke refresh token if available
+          if (token.refreshToken) {
+            console.log(`Revoking refresh token on server...`);
+            await oauthProvider.revokeToken(
+              token.refreshToken,
+              'refresh_token',
+            );
+          }
+        } catch (error) {
+          console.warn(
+            `⚠️  Token revocation failed, removing local credentials anyway`,
+          );
+          console.warn(
+            `   ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+
+      // 2. Remove local credentials
       auth.removeCredentials(serverName);
       console.log(`✓ Removed OAuth credentials for ${serverName}`);
     } catch (error) {

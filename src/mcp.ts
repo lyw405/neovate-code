@@ -379,11 +379,30 @@ export class MCPManager {
   }
 
   private async _createClient(serverName: string, config: MCPConfig) {
+    // Get OAuth token if available (for all transport types)
+    const serverState = this.servers.get(serverName);
+    let oauthToken: string | undefined;
+
+    if (serverState?.oauthProvider) {
+      oauthToken = await serverState.oauthProvider.getAccessToken();
+      if (oauthToken) {
+        debug(`OAuth token obtained for ${serverName}`);
+      }
+    }
+
     if (config.command) {
       // Stdio transport (for local servers only)
-      const env = config.env
+      const env: Record<string, string> = config.env
         ? { ...config.env, PATH: process.env.PATH || '' }
-        : undefined;
+        : { PATH: process.env.PATH || '' };
+
+      // Inject OAuth token via environment variable for stdio transport
+      if (oauthToken) {
+        env.MCP_OAUTH_TOKEN = oauthToken;
+        debug(
+          `Added OAuth token to environment for stdio transport: ${serverName}`,
+        );
+      }
 
       const { Experimental_StdioMCPTransport } = await import(
         '@ai-sdk/mcp/mcp-stdio'
@@ -398,16 +417,13 @@ export class MCPManager {
         }),
       });
     } else if (config.url) {
-      // Get OAuth token if available
-      const serverState = this.servers.get(serverName);
+      // HTTP or SSE transport
       const headers = { ...config.headers };
 
-      if (serverState?.oauthProvider) {
-        const token = await serverState.oauthProvider.getAccessToken();
-        if (token) {
-          headers.Authorization = `Bearer ${token}`;
-          debug(`Added OAuth token to headers for ${serverName}`);
-        }
+      // Inject OAuth token via Authorization header for HTTP/SSE transport
+      if (oauthToken) {
+        headers.Authorization = `Bearer ${oauthToken}`;
+        debug(`Added OAuth token to headers for ${serverName}`);
       }
 
       // HTTP or SSE transport

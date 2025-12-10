@@ -14,6 +14,20 @@ export interface McpOAuthConfig {
   authorizationEndpoint?: string;
   tokenEndpoint?: string;
   registrationEndpoint?: string;
+  revocationEndpoint?: string;
+}
+
+/**
+ * OAuth metadata (RFC 8414)
+ */
+export interface OAuthMetadata {
+  authorizationEndpoint: string;
+  tokenEndpoint: string;
+  registrationEndpoint?: string;
+  revocationEndpoint?: string;
+  scopesSupported?: string[];
+  responseTypesSupported?: string[];
+  grantTypesSupported?: string[];
 }
 
 /**
@@ -49,7 +63,7 @@ export class McpOAuthProvider {
       return undefined;
     }
 
-    // Check if token is expired
+    // Check if token is expired or expiring soon (within 5 minutes)
     if (this.auth.isTokenExpired(this.serverName)) {
       debug(`Token expired for ${this.serverName}, attempting refresh`);
 
@@ -57,9 +71,26 @@ export class McpOAuthProvider {
         try {
           const newToken = await this.refreshToken(token.refreshToken);
           this.auth.saveToken(this.serverName, newToken);
+          debug(`Token refreshed successfully for ${this.serverName}`);
           return newToken.accessToken;
         } catch (error) {
           debug(`Token refresh failed: ${error}`);
+
+          // Enhanced fallback strategy:
+          // If refresh fails but token hasn't completely expired yet,
+          // try to use the existing token (grace period)
+          const isCompletelyExpired = token.expiresAt
+            ? Date.now() >= token.expiresAt
+            : true;
+
+          if (!isCompletelyExpired) {
+            debug(
+              `Using existing token despite refresh failure (grace period) for ${this.serverName}`,
+            );
+            return token.accessToken;
+          }
+
+          debug(`Token completely expired for ${this.serverName}`);
           return undefined;
         }
       }
@@ -157,8 +188,8 @@ export class McpOAuthProvider {
     // Generate code challenge from verifier (PKCE)
     const codeChallenge = await this.generateCodeChallenge(codeVerifier);
 
-    const authEndpoint =
-      this.config.authorizationEndpoint || `${this.serverUrl}/oauth/authorize`;
+    // Get endpoints with metadata discovery fallback
+    const endpoints = await this.getEndpoints();
 
     const params = new URLSearchParams({
       client_id: clientId,
@@ -173,7 +204,7 @@ export class McpOAuthProvider {
       params.set('scope', this.config.scope);
     }
 
-    const url = `${authEndpoint}?${params.toString()}`;
+    const url = `${endpoints.authorizationEndpoint}?${params.toString()}`;
     debug(`Authorization URL generated for ${this.serverName}`);
 
     return url;
@@ -186,8 +217,8 @@ export class McpOAuthProvider {
     code: string,
     codeVerifier: string,
   ): Promise<McpTokenInfo> {
-    const tokenEndpoint =
-      this.config.tokenEndpoint || `${this.serverUrl}/oauth/token`;
+    // Get endpoints with metadata discovery fallback
+    const endpoints = await this.getEndpoints();
 
     let clientId = this.config.clientId;
     let clientSecret = this.config.clientSecret;
@@ -201,7 +232,7 @@ export class McpOAuthProvider {
       clientSecret = client.clientSecret;
     }
 
-    debug(`Exchanging code for token at ${tokenEndpoint}`);
+    debug(`Exchanging code for token at ${endpoints.tokenEndpoint}`);
 
     const body = new URLSearchParams({
       grant_type: 'authorization_code',
@@ -224,7 +255,7 @@ export class McpOAuthProvider {
     }
 
     try {
-      const response = await fetch(tokenEndpoint, {
+      const response = await fetch(endpoints.tokenEndpoint, {
         method: 'POST',
         headers,
         body,
@@ -261,8 +292,8 @@ export class McpOAuthProvider {
    * Refresh access token
    */
   private async refreshToken(refreshToken: string): Promise<McpTokenInfo> {
-    const tokenEndpoint =
-      this.config.tokenEndpoint || `${this.serverUrl}/oauth/token`;
+    // Get endpoints with metadata discovery fallback
+    const endpoints = await this.getEndpoints();
 
     let clientId = this.config.clientId;
     let clientSecret = this.config.clientSecret;
@@ -295,7 +326,7 @@ export class McpOAuthProvider {
       headers.Authorization = `Basic ${auth}`;
     }
 
-    const response = await fetch(tokenEndpoint, {
+    const response = await fetch(endpoints.tokenEndpoint, {
       method: 'POST',
       headers,
       body,
@@ -353,5 +384,145 @@ export class McpOAuthProvider {
     const array = new Uint8Array(16);
     crypto.getRandomValues(array);
     return Buffer.from(array).toString('hex');
+  }
+
+  /**
+   * Discover OAuth metadata (RFC 8414)
+   */
+  async discoverMetadata(): Promise<OAuthMetadata | undefined> {
+    const metadataUrl = `${this.serverUrl}/.well-known/oauth-authorization-server`;
+
+    try {
+      debug(`Discovering OAuth metadata from ${metadataUrl}`);
+      const response = await fetch(metadataUrl);
+
+      if (!response.ok) {
+        debug(`Metadata discovery failed: ${response.status}`);
+        return undefined;
+      }
+
+      const metadata = await response.json();
+
+      return {
+        authorizationEndpoint: metadata.authorization_endpoint,
+        tokenEndpoint: metadata.token_endpoint,
+        registrationEndpoint: metadata.registration_endpoint,
+        revocationEndpoint: metadata.revocation_endpoint,
+        scopesSupported: metadata.scopes_supported,
+        responseTypesSupported: metadata.response_types_supported,
+        grantTypesSupported: metadata.grant_types_supported,
+      };
+    } catch (error) {
+      debug(`Metadata discovery error: ${error}`);
+      return undefined;
+    }
+  }
+
+  /**
+   * Get OAuth endpoints with fallback strategy:
+   * 1. Use configured endpoints
+   * 2. Try metadata discovery
+   * 3. Fall back to conventional defaults
+   */
+  private async getEndpoints(): Promise<{
+    authorizationEndpoint: string;
+    tokenEndpoint: string;
+    revocationEndpoint?: string;
+  }> {
+    // First try to use configured endpoints
+    if (this.config.authorizationEndpoint && this.config.tokenEndpoint) {
+      return {
+        authorizationEndpoint: this.config.authorizationEndpoint,
+        tokenEndpoint: this.config.tokenEndpoint,
+        revocationEndpoint: this.config.revocationEndpoint,
+      };
+    }
+
+    // Try metadata discovery
+    const metadata = await this.discoverMetadata();
+    if (metadata) {
+      debug('Using discovered OAuth endpoints');
+      return {
+        authorizationEndpoint: metadata.authorizationEndpoint,
+        tokenEndpoint: metadata.tokenEndpoint,
+        revocationEndpoint: metadata.revocationEndpoint,
+      };
+    }
+
+    // Fall back to conventional defaults
+    debug('Using default OAuth endpoints');
+    return {
+      authorizationEndpoint: `${this.serverUrl}/oauth/authorize`,
+      tokenEndpoint: `${this.serverUrl}/oauth/token`,
+      revocationEndpoint: `${this.serverUrl}/oauth/revoke`,
+    };
+  }
+
+  /**
+   * Revoke OAuth token (RFC 7009)
+   */
+  async revokeToken(
+    token: string,
+    tokenTypeHint?: 'access_token' | 'refresh_token',
+  ): Promise<void> {
+    const endpoints = await this.getEndpoints();
+
+    if (!endpoints.revocationEndpoint) {
+      debug('Server does not support token revocation');
+      return;
+    }
+
+    const clientId =
+      this.config.clientId || this.auth.getClient(this.serverName)?.clientId;
+    if (!clientId) {
+      throw new Error('Client ID required for token revocation');
+    }
+
+    debug(`Revoking token for ${this.serverName}`);
+
+    const body = new URLSearchParams({
+      token,
+      client_id: clientId,
+    });
+
+    if (tokenTypeHint) {
+      body.append('token_type_hint', tokenTypeHint);
+    }
+
+    const headers: HeadersInit = {
+      'Content-Type': 'application/x-www-form-urlencoded',
+    };
+
+    // Add client authentication if secret is available
+    const clientSecret =
+      this.config.clientSecret ||
+      this.auth.getClient(this.serverName)?.clientSecret;
+    if (clientSecret) {
+      const auth = Buffer.from(`${clientId}:${clientSecret}`).toString(
+        'base64',
+      );
+      headers.Authorization = `Basic ${auth}`;
+    }
+
+    try {
+      const response = await fetch(endpoints.revocationEndpoint, {
+        method: 'POST',
+        headers,
+        body,
+      });
+
+      // RFC 7009: The authorization server responds with HTTP status code 200
+      // if the token has been revoked successfully or if the client
+      // submitted an invalid token.
+      if (!response.ok && response.status !== 200) {
+        const errorText = await response.text();
+        throw new Error(`Token revocation failed: ${errorText}`);
+      }
+
+      debug(`Token revoked successfully for ${this.serverName}`);
+    } catch (error) {
+      debug(`Token revocation error: ${error}`);
+      throw error;
+    }
   }
 }

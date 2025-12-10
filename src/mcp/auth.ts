@@ -44,9 +44,7 @@ interface McpAuthStorage {
 export class McpAuth {
   private static readonly AUTH_FILE_PATH = join(
     homedir(),
-    '.local',
-    'share',
-    'neovate-code',
+    '.neovate',
     'mcp-auth.json',
   );
   private static readonly CURRENT_VERSION = '1.0';
@@ -120,14 +118,18 @@ export class McpAuth {
   }
 
   /**
-   * Check if token is expired
+   * Check if token is expired or expiring soon (within 5 minutes)
+   * This allows proactive token refresh before expiration
    */
   isTokenExpired(serverName: string): boolean {
     const token = this.getToken(serverName);
     if (!token || !token.expiresAt) {
       return false;
     }
-    return Date.now() >= token.expiresAt;
+    // Token is considered expired if it expires within 5 minutes
+    // This prevents requests from failing due to token expiration during processing
+    const BUFFER_TIME = 5 * 60 * 1000; // 5 minutes in milliseconds
+    return token.expiresAt - Date.now() < BUFFER_TIME;
   }
 
   /**
